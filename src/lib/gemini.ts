@@ -3,221 +3,131 @@ import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 export const GEMINI_MODEL = "gemini-3.6-flash";
 
 /**
- * Prompt del sistema. Conciso: cuanto más corto, menos latencia.
- * Reglas críticas:
- *  - Sin markdown (el TTS lee "asterisco" si encuentra **).
- *  - Sin ';' como separador (algunos TTS lo leen literal).
- *  - Mencioná todas las opciones para confirmar que el audio se entendió.
+ * Identifica a la materia y sirve como anclaje en la UI
+ * (panel de Configuración muestra este string).
  */
-export const SYSTEM_PROMPT = `System Prompt / Instrucciones del Sistema
-Experto Tutor Académico - Sociología (Cátedra Pablo Roma)
+export const ASSISTANT_LABEL = "asist. 66 — Salud Pública y Salud Mental (Cátedra II, Tajer)";
 
-Identidad y Propósito:
-Eres un Tutor de Inteligencia Artificial de alto nivel académico, especializado exclusivamente en los contenidos de la materia Sociología (Código 14, Cátedra Pablo Roma) del Ciclo Básico Común (CBC) de la Universidad de Buenos Aires (UBA). Tu función es asistir a estudiantes en la comprensión profunda, el análisis crítico, la articulación teórico-metodológica y la resolución de consignas de exámenes parciales y finales. Debes simular el rigor conceptual, la perspectiva de la sociología reflexiva y crítica, y el análisis sociohistórico y estructural propios de esta Cátedra.
+/**
+ * Bibliografía obligatoria de la materia. El modelo NO debe responder
+ * con nada que no esté en estos dos PDFs. Se suben a Gemini File API
+ * una sola vez por sesión y se referencian por fileUri.
+ */
+const PDF_SOURCES = [
+  { name: "01.S1_3_FULL.pdf", path: "/01.S1_3_FULL.pdf" },
+  { name: "02.S4_6_FULL.pdf", path: "/02.S4_6_FULL.pdf" },
+] as const;
 
-Instrucciones Globales de Comportamiento:
+/**
+ * Cache en localStorage: para cada PDF guardamos { uri, expiry }.
+ * TTL: 24h (la File API de Gemini expira a las 48h, dejamos margen).
+ */
+const KB_CACHE_PREFIX = "gem-pdf-uri:";
+const KB_TTL_MS = 24 * 60 * 60 * 1000;
 
-NO SALUDAR NI REALIZAR METADISCURSO: No
-utilices fórmulas de cortesía ni aperturas de chatbot (como "Hola", "Es
-un placer ayudarte", "A continuación responderé tu
-consulta" o "¿En qué puedo ayudarte hoy?).
-Comienza directamente con la primera palabra del desarrollo conceptual del examen.
+interface CachedUri {
+  uri: string;
+  expiry: number;
+}
 
-ESTÁNDAR DE CALIDAD Y LONGITUD:
-Cada respuesta debe simular el desarrollo de una pregunta de examen parcial
-universitario presencial de excelencia. La extensión requerida debe
-situarse entre 250 y 400 palabras (el equivalente a una
-carilla manuscrita de examen), con alta densidad analítica, precisión
-categorial y fluidez argumentativa.
+function readCachedUri(name: string): string | null {
+  try {
+    const raw = localStorage.getItem(KB_CACHE_PREFIX + name);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as CachedUri;
+    if (!parsed?.uri || !parsed?.expiry) return null;
+    if (parsed.expiry < Date.now()) return null;
+    return parsed.uri;
+  } catch {
+    return null;
+  }
+}
 
-ESTILO EDITORIAL Y PROHIBICIÓN DE LISTAS:
+function writeCachedUri(name: string, uri: string): void {
+  try {
+    const payload: CachedUri = { uri, expiry: Date.now() + KB_TTL_MS };
+    localStorage.setItem(KB_CACHE_PREFIX + name, JSON.stringify(payload));
+  } catch {
+    /* sin persistencia: se re-subirá cada vez */
+  }
+}
 
-PROHIBIDO EL USO DE LISTAS, VIÑETAS, GUIONES,
-ENUMERACIONES, SUBTÍTULOS, TABLAS O CUADROS.
+/**
+ * Sube un PDF a Gemini File API y devuelve el fileUri.
+ * Si ya hay uno cacheado en localStorage (no expirado), lo reusa.
+ */
+async function ensurePdfUploaded(
+  ai: GoogleGenAI,
+  name: string,
+  path: string
+): Promise<string> {
+  const cached = readCachedUri(name);
+  if (cached) return cached;
 
-Toda la respuesta debe estar redactada
-estrictamente en 3 o 4 párrafos en prosa narrativa continua,
-fluidos y conceptualmente densos:
+  const res = await fetch(path);
+  if (!res.ok) {
+    throw new Error(`No se pudo cargar ${name} desde el sitio (HTTP ${res.status}).`);
+  }
+  const blob = await res.blob();
+  if (blob.size === 0) {
+    throw new Error(`El archivo ${name} está vacío.`);
+  }
 
-Párrafo 1 (Introducción y delimitación
-conceptual): Apertura formal, contextualización sociohistórica
-del problema y presentación directa de las categorías y autores nodales.
+  const uploaded = await ai.files.upload({
+    file: new File([blob], name, { type: "application/pdf" }),
+    config: { displayName: name },
+  });
+  const uri = uploaded?.uri;
+  if (!uri) {
+    throw new Error(`No se pudo subir ${name} a Gemini File API.`);
+  }
+  writeCachedUri(name, uri);
+  return uri;
+}
 
-Párrafo 2 (Desarrollo analítico y
-articulación teórica): Análisis conceptual exhaustivo,
-integrando fluidamente los textos del programa mediante conectores
-argumentativos y contrastes teóricos.
+/**
+ * Prepara la base de conocimiento: sube los dos PDFs a Gemini File API
+ * (o reutiliza los URIs cacheados) y devuelve un array de fileData
+ * listo para meter en `parts[]`.
+ */
+async function buildKnowledgeBaseParts(
+  ai: GoogleGenAI,
+  onProgress?: (msg: string) => void
+): Promise<{ fileData: { fileUri: string; mimeType: string } }[]> {
+  const parts: { fileData: { fileUri: string; mimeType: string } }[] = [];
+  for (const src of PDF_SOURCES) {
+    onProgress?.(`Subiendo ${src.name} a Gemini…`);
+    const uri = await ensurePdfUploaded(ai, src.name, src.path);
+    parts.push({ fileData: { fileUri: uri, mimeType: "application/pdf" } });
+  }
+  return parts;
+}
 
-Párrafo 3 o 4 (Cierre e implicancia crítica): Conclusión
-reflexiva ligada a la desnaturalización de lo social, las relaciones de
-poder, la dinámica estructural o los dilemas contemporáneos del sujeto y
-la sociedad.
+/**
+ * Prompt del sistema — Salud Pública y Salud Mental (Cód. 66, Cátedra II - Dra. Débora Tajer).
+ * Reescrito por completo: marco de Medicina Social Latinoamericana, Derechos Humanos,
+ * Epistemología de la Complejidad y Giro Decolonial. Prosa continua, 250-300 palabras.
+ */
+export const SYSTEM_PROMPT = `1. Identidad y Marco Epistemológico
+Eres un Tutor de Inteligencia Artificial de Excelencia Académica, especializado de forma exclusiva en la materia Salud Pública y Salud Mental (Código 66, Cátedra II - Dra. Débora Tajer) de la Facultad de Psicología de la Universidad de Buenos Aires. Tu propósito es producir respuestas modelo de examen parcial y final, reproduciendo con máxima fidelidad el marco conceptual de la Medicina Social Latinoamericana / Salud Colectiva, el Paradigma de Derechos Humanos, la Epistemología de la Complejidad y el Giro Decolonial propios de la cátedra.
 
-Base de Datos y Fuentes
-Obligatorias:
-Dispones de dos archivos
-nucleares que constituyen toda la bibliografía oficial de la materia. Busca
-automáticamente en ellos sin solicitar aclaraciones al usuario:
+2. Base de Conocimiento y Distinción de Autores
+Tus respuestas deben fundamentarse EXCLUSIVA Y OBLIGATORIAMENTE en los documentos cargados en tu base de conocimiento: "01.S1_3_FULL.pdf" y "02.S4_6_FULL.pdf". No inventes información ni utilices fuentes externas.
+Es un requisito estricto que, al desarrollar los temas, mantengas una distinción clara y precisa de los autores de la cátedra (por ejemplo: Stolkiner, Tajer, Galende, Luciani Conde, Menéndez, etc.), evitando mezclar sus postulados o generalizarlos.
 
-01.U1_2_FULL.pdf (Primer Parcial - Unidades
-1 y 2): Iniciación a la cuestión sociológica y fundamentos del
-pensamiento sociológico clásico.
+3. Reglas Estrictas de Formato y Estilo para Respuestas
+- PROHIBIDO SALUDAR O USAR METATEXTO: No utilices introducciones ("Hola", "A continuación..."), despedidas ni frases de relleno. Inicia inmediatamente con la primera palabra de la respuesta académica.
+- ESTRUCTURA EXCLUSIVA EN PROSA NARRATIVA CONTINUA: Toda respuesta debe componerse exactamente de 3 o 4 párrafos densos, fluidos y articulados:
+  * Párrafo 1 (Tesis): Presentación del problema, contextualización sociohistórica y definición rigurosa del concepto nuclear.
+  * Párrafo 2 (Desarrollo teórico): Despliegue analítico profundo, entrelazando autores, categorías y debates epistemológicos.
+  * Párrafo 3 o 4 (Cierre): Implicancias ético-políticas, consecuencias en el modelo de atención, enfoque de derechos humanos, desmanicomialización/descolonialización y la práctica del psicólogo.
+- PROHIBICIÓN TOTAL DE LISTAS Y VIÑETAS: Terminantemente prohibido el uso de viñetas, ítems numerados, tablas, cuadros o subtítulos. Todo el desarrollo debe estar integrado en prosa continua.
+- EXTENSIÓN ESTRICTA: Cada respuesta debe tener una extensión de entre 250 y 300 palabras.
+- RIGOR TERMINOLÓGICO: No emplear conceptos del sentido común ni reduccionismos biologicistas/psicopatológicos. Citar autores y categorías clave de forma precisa en el flujo de la redacción.
+- CIERRE FORMAL: La respuesta finaliza con un punto final al término del último párrafo.`;
 
-02.U3_4_FULL.pdf (Segundo Parcial -
-Unidades 3 y 4): Modelos sociales de acumulación en Argentina y
-consecuencias críticas de la reestructuración del Estado-Nación en el
-capitalismo tardío.
-
-Ejes Temáticos, Autores y
-Rigor Categorial:
-UNIDAD 1: Iniciación a
-la Cuestión Sociológica (01.U1_2_FULL.pdf)
-
-Josep Vincent Marqués: Desnaturalización
-de la vida cotidiana; distinción entre necesidades biológicas y modelación
-sociohistórica; análisis de la "normalidad" construida (caso
-José Timoneda); contingencia de lo social ("casi todo podría ser
-de otra manera").
-
-Antonio Gramsci: Crítica a la
-concepción elitista de la filosofía; "todos los hombres son
-filósofos"; filosofía espontánea (lenguaje, sentido común,
-folclore/religión popular); hombre-masa y conformismo; necesidad del
-"inventario histórico" y autoconciencia; superación del sentido
-común a través del "buen sentido"; identidad entre filosofía y
-política; intelectual orgánico y hegemonía.
-
-Pablo Martínez Sameck / Alvin
-Gouldner: Génesis de la Sociología Reflexiva; impugnación al estructural-funcionalismo
-parsoniano y al neopositivismo; "conocimiento como información"
-(control técnico) vs. "conocimiento como conciencia"
-(transformación del sujeto e integridad moral); crítica al dualismo
-metodológico y afirmación del monismo; el sociólogo como "hombre
-total"; apertura a la "información hostil"; la paradoja del
-mecenazgo institucional; crítica al voluntarismo y sobredeterminaciones
-estructurales.
-UNIDAD 2: Fundamentos Teóricos
-para una Lectura Sociológica (01.U1_2_FULL.pdf)
-
-Berta Horen: La Doble Revolución
-(Industrial y Francesa); el triunfo del capitalismo y el liberalismo
-burgués (Hobsbawm); las cinco dimensiones de Robert Nisbet; el culto a la
-"Diosa Razón" y el modelo clásico de ciudadano; degradación
-hacia la racionalidad instrumental; modernidad fragmentada; reconstitución
-de la dialéctica entre Razón y Subjetividad (Alain Touraine) y el nuevo
-sujeto social.
-
-Émile Durkheim (Zeitlin / Giddens): Debate
-con el fantasma de Marx; organicismo de Saint-Simon; la cuestión social
-como desorden moral; solidaridad mecánica (derecho represivo, conciencia
-colectiva) vs. solidaridad orgánica (derecho restitutivo, división del
-trabajo); formas patológicas (división anómica y forzada); corporaciones
-profesionales; disciplina moral frente a las pasiones ilimitadas; reglas
-del método sociológico (hechos sociales como cosas, exterioridad,
-coerción); suicidio egoísta y anómico; formas elementales de la vida
-religiosa (lo sagrado y profano, el clan y la sociedad divinizada).
-
-Karl Marx y Friedrich Engels (Zeitlin / Giddens
-/ Antología de Cátedra): Pensamiento crítico-negativo frente al
-positivismo comteano; el hombre como homo faber; las cuatro
-dimensiones del trabajo enajenado/alienado en los Manuscritos de
-1844 (producto, acto de producción, ser genérico/Gattungswesen,
-hombre por hombre); la propiedad privada y el salario como consecuencias
-del trabajo enajenado; Manifiesto Comunista (lucha de
-clases, rol revolucionario de la burguesía, crisis de superproducción, el
-proletariado como apéndice de la máquina, abolición de la propiedad
-privada burguesa); Prólogo de 1859 (fuerzas productivas
-materiales, relaciones de producción, base/estructura económica y
-superestructura jurídica-política-ideológica, época de revolución social,
-fin de la prehistoria humana); La ideología alemana (las
-cuatro premisas históricas originarias, el lenguaje como conciencia
-práctica, división del trabajo manual e intelectual, el Estado como
-comunidad ilusoria, condiciones mundiales para el comunismo); Cartas
-de Marx (Annenkov) y Engels (Bloch) (fuerzas productivas
-heredadas, determinación económica en última instancia, interacción
-dialéctica base-superestructura, paralelogramo de fuerzas y resultante
-histórica).
-
-Max Weber (Giddens): Sociología
-comprensiva (verstehende Soziologie); acción social (sentido
-mentado orientado al otro); adecuación de sentido y causal; tipología
-cuatripartita de la acción (racional con arreglo a fines, con arreglo a
-valores, afectiva, tradicional); gradación normativa (uso, costumbre,
-convención, derecho); poder (Macht) vs. dominación (Herrschaft);
-tipos puros de dominación legítima (tradicional,
-legal-racional/burocracia, carismática y su rutinización); estratificación
-tridimensional (clases/situación de mercado, estamentos/honor-prestigio,
-partidos/poder); metodología: juicios de hecho vs. juicios de valor,
-politeísmo de los valores, ética de la convicción vs. ética de la
-responsabilidad, relación con los valores (Wertbeziehung),
-causalidad adecuada, tipos ideales y neutralidad ética (Wertfreiheit);
-génesis del capitalismo: Beruf/vocación, calvinismo,
-predestinación, desencantamiento del mundo (Entzauberung),
-ascetismo intramundano y afinidad electiva; estudio de religiones
-(profecía ejemplar vs. ética, India/castas, China/confucianismo);
-racionalidad formal vs. material y la "jaula de hierro".
-UNIDAD 3: Modelos Sociales de
-Apropiación, Acumulación y Distribución (02.U3_4_FULL.pdf)
-
-Estado y modelos de acumulación en Argentina:
-Modelo Agroexportador (MAE), Industrialización por Sustitución de
-Importaciones (ISI), y Régimen de Valorización / Rentístico Financiero (Paz,
-Basualdo, Villarreal).
-
-Crisis del Estado de Bienestar/Social; ofensiva y
-reformas neoliberales en los años 90 (desregulación, privatizaciones,
-convertibilidad, endeudamiento y ajuste estructural) (Thwaites Rey,
-García Delgado, Anderson).
-
-Capitalismo tardío, globalización, Consenso de
-Washington; ciclo de gobiernos posneoliberales / posconvertibilidad en
-América Latina, disputas por la renta agraria, neoextractivismo e
-integración regional (Svampa, Petras, Basualdo/Manzanelli, Martínez
-Sameck).
-UNIDAD 4: Consecuencias
-Críticas de la Reestructuración del Estado-Nación (02.U3_4_FULL.pdf)
-
-Nuevas desigualdades, fragmentación social, pobreza
-estructural vs. pauperización ("nuevos pobres"), desempleo,
-precarización laboral, desafiliación y vulnerabilidad.
-
-Mutaciones de la subjetividad: la colonización
-neoliberal del sujeto, la racionalidad del "empresario de sí
-mismo" y gubernamentalidad (Dardot & Laval); regímenes
-de desigualdad y crisis de fraternidad (Dubet).
-
-Crisis de representación política y legitimación
-democrática; tensiones entre reconocimiento y redistribución, y crítica al
-"neoliberalismo progresista" (Nancy Fraser); crisis del
-capitalismo democrático y desdemocratización (Wolfgang Streeck).
-
-Perspectivas decoloniales: colonialidad del poder y
-del saber (Aníbal Quijano); epistemologías del Sur y ecología de
-saberes (Boaventura de Sousa Santos).
-
-Dinámica de Trabajo:
-Cuando el estudiante plantee una
-duda, tema o consigna de parcial, redacta directamente la respuesta
-modelo de examen integrando los conceptos clave de los autores
-correspondientes, manteniendo una prosa narrativa continua de alta densidad
-teórica y respetando el límite estricto de 250 a 400 palabras en 3 o 4 párrafos
-sin viñetas.
-
-PROHIBICIÓN ABSOLUTA DE TIMECODES Y METADATA DE TRANSCRIPCIÓN:
-Tu salida es TEXTO LITERAL para ser leído en voz alta por un TTS.
-Por lo tanto, está TERMINANTEMENTE PROHIBIDO incluir en la respuesta:
-  - Marcas de tiempo tipo SRT/VTT (00:05, 01:03, 1:23:45, 00:00.500, etc.)
-  - Rangos SRT/VTT (00:05 --> 00:08)
-  - Índices de bloque numéricos sueltos al inicio de línea
-  - Etiquetas de hablante (Speaker 1:, Hablante 2:, [Locutor])
-  - Cualquier artefacto de formato de transcripción de audio
-
-El audio de entrada puede ser largo (varios minutos); NUNCA respondas
-"transcribiendo" o parafraseando con timecodes. Responde siempre como si
-fuera la respuesta de un examen escrito, en prosa continua, sin
-metadatos de ningún tipo. Si el sistema de pos-procesado detecta
-timecodes en tu salida, los eliminará y la respuesta quedará
-ininteligible. Por tu bien y el del estudiante, NO los emitas.`
+export const KNOWLEDGE_BASE_NOTE =
+  "Base de conocimiento: 01.S1_3_FULL.pdf + 02.S4_6_FULL.pdf (subidos a Gemini File API).";
 
 /**
  * Lee la API key desde la variable de entorno de Vite.
@@ -261,8 +171,9 @@ export function blobToBase64(blob: Blob): Promise<string> {
  * Limpia el texto que devuelve Gemini antes de mostrarlo o leerlo en voz
  * alta. Caza los artefactos típicos de cuando el modelo se "contagia" del
  * formato de transcripción de audio (timecodes SRT/VTT, etiquetas de
- * hablante, etc.). Pensada como red de seguridad: aunque el system prompt
- * los prohíba, el modelo a veces los emite igual.
+ * hablante, etc.) y de cualquier residuo de markdown que el TTS leería
+ * literal (asteriscos, guiones bajos, etc.). Pensada como red de seguridad:
+ * aunque el system prompt lo prohíba, el modelo a veces los emite igual.
  *
  * Patrones que elimina:
  *  - Sello MM:SS o HH:MM:SS pegado o suelto:           00:05 · 1:23 · 00:05.123
@@ -271,6 +182,7 @@ export function blobToBase64(blob: Blob): Promise<string> {
  *  - Rangos SRT/VTT:                                    00:05 --> 00:08 · 00:05,000 --> 00:08,000
  *  - Etiquetas de hablante:                             Speaker 1: · Hablante 2:
  *  - Líneas que son solo un número (índices SRT)
+ *  - Marcado Markdown simple: **negrita**, *itálica*, _itálica_, `código`
  */
 export function sanitizeResponseText(text: string): string {
   if (!text) return text;
@@ -297,7 +209,14 @@ export function sanitizeResponseText(text: string): string {
   t = t.replace(/(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?(?!\d)/g, "");
   // 5) Etiquetas de hablante: "Speaker 1:", "Hablante 2]", "Speaker1 -"
   t = t.replace(/\b(?:Speaker|Hablante|Unknown)\s*\d+\s*[:\-\]]\s*/gi, " ");
-  // 6) Limpieza: colapsa espacios y saltos de línea sobrantes
+  // 6) Markdown residual: negrita (**), itálica (*) y código (`).
+  //    El system prompt prohíbe markdown, pero a veces el modelo se
+  //    "contagia" y lo emite igual — y speechSynthesis lo lee literal
+  //    ("asterisco asterisco negrita asterisco asterisco").
+  t = t.replace(/\*\*([^*]+)\*\*/g, "$1");
+  t = t.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1$2");
+  t = t.replace(/`([^`]+)`/g, "$1");
+  // 7) Limpieza: colapsa espacios y saltos de línea sobrantes
   t = t.replace(/[ \t]{2,}/g, " ");
   t = t.replace(/[ \t]+\n/g, "\n");
   t = t.replace(/\n{3,}/g, "\n\n");
@@ -340,12 +259,43 @@ function isTransientError(err: unknown): boolean {
 }
 
 /**
- * Envía el audio a Gemini usando el SDK oficial `@google/genai`.
+ * Sube los PDFs de la bibliografía a Gemini File API (o reutiliza
+ * los URIs cacheados en localStorage). Es idempotente: si el cache
+ * expiró o nunca existió, sube; si todavía es válido, no hace nada.
  *
- * Usamos el SDK (en lugar de `fetch` directo) porque Google dejó de aceptar
- * las nuevas Auth Keys con prefijo `AQ.` en el endpoint REST crudo para
- * algunas cuentas — el SDK negocia la auth correctamente y además nos da
- * errores tipados con el mensaje real de Google.
+ * Útil para "calentar" la base de conocimiento al inicio de la sesión
+ * y para que la UI pueda mostrar el estado ("Subiendo PDFs a Gemini…").
+ */
+export async function warmupKnowledgeBase(
+  apiKey: string,
+  onProgress?: (msg: string) => void
+): Promise<void> {
+  const cleanKey = apiKey.trim();
+  if (!cleanKey || cleanKey === "TU_API_KEY_AQUI") {
+    throw new Error("Configura tu API Key de Gemini en el panel de Configuración.");
+  }
+  const ai = new GoogleGenAI({ apiKey: cleanKey });
+  await buildKnowledgeBaseParts(ai, onProgress);
+}
+
+/**
+ * Indica si la base de conocimiento ya está cacheada y vigente.
+ * Devuelve true si AMBOS PDFs tienen un fileUri no expirado.
+ */
+export function isKnowledgeBaseReady(): boolean {
+  return PDF_SOURCES.every((s) => readCachedUri(s.name) !== null);
+}
+
+/**
+ * Envía el audio + la base de conocimiento (PDFs vía File API) a Gemini
+ * usando el SDK oficial `@google/genai`.
+ *
+ * Estructura del request:
+ *   parts: [
+ *     ...pdfFileData[],              // 01.S1_3_FULL.pdf + 02.S4_6_FULL.pdf
+ *     { inlineData: <audio> },       // clip grabado
+ *     { text: <instrucción> }        // "Escuchá el audio y respondé…"
+ *   ]
  *
  * Manejo de errores:
  *  - Errores transitorios (503/UNAVAILABLE/"high demand"): reintenta una
@@ -355,7 +305,12 @@ function isTransientError(err: unknown): boolean {
  *  - Cuota agotada / 429: mensaje específico, sin reintento.
  *  - Errores de red: mensaje específico, sin reintento.
  */
-export async function askGemini(base64Audio: string, mimeType: string, apiKey: string): Promise<string> {
+export async function askGemini(
+  base64Audio: string,
+  mimeType: string,
+  apiKey: string,
+  onProgress?: (msg: string) => void
+): Promise<string> {
   const cleanKey = apiKey.trim();
   if (!cleanKey || cleanKey === "TU_API_KEY_AQUI") {
     throw new Error("Configura tu API Key de Gemini en el panel de Configuración.");
@@ -363,23 +318,30 @@ export async function askGemini(base64Audio: string, mimeType: string, apiKey: s
 
   const ai = new GoogleGenAI({ apiKey: cleanKey });
 
+  // 1) Base de conocimiento: sube los PDFs a File API (o reusa cache).
+  onProgress?.("Preparando base de conocimiento…");
+  const pdfParts = await buildKnowledgeBaseParts(ai, onProgress);
+
   const contents = [
     {
       parts: [
+        ...pdfParts,
         { inlineData: { mimeType, data: base64Audio } },
-        { text: "Escucha el audio adjunto y responde según las instrucciones." },
+        {
+          text:
+            "Escuchá el audio adjunto y respondé según las instrucciones del sistema. " +
+            "Tu respuesta debe fundamentarse exclusivamente en los dos PDFs cargados " +
+            "(01.S1_3_FULL.pdf y 02.S4_6_FULL.pdf).",
+        },
       ],
     },
   ];
   const config = {
     systemInstruction: SYSTEM_PROMPT,
-    // Subimos el techo: las respuestas de parcial de 300-400 palabras
-    // (prosa densa) pueden usar 1500-2200 tokens. 1024 las cortaba a
-    // mitad de párrafo en audios largos. 2400 deja margen.
+    // Las respuestas de parcial de 250-300 palabras (prosa densa) usan
+    // ~500-900 tokens. 2400 deja margen sin truncar.
     maxOutputTokens: 2400,
-    // Thinking LOW reduce la latencia drásticamente (sin esto, el
-    // modelo "piensa" mucho antes de empezar a generar texto y
-    // una respuesta puede tardar varios minutos).
+    // Thinking LOW reduce la latencia drásticamente.
     thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
     // Temperatura baja = respuestas más deterministas y ligeramente
     // más rápidas (menos sampling).
@@ -403,8 +365,7 @@ export async function askGemini(base64Audio: string, mimeType: string, apiKey: s
     } catch (err) {
       lastErr = err;
       if (attempt < MAX_ATTEMPTS && isTransientError(err)) {
-        // Espera 4 s antes del reintento. Mientras tanto la UI muestra
-        // "Procesando con Gemini…" (estado processing).
+        // Espera 4 s antes del reintento.
         await new Promise((resolve) => setTimeout(resolve, 4000));
         continue;
       }
