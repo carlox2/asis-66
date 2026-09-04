@@ -13,9 +13,12 @@ export const ASSISTANT_LABEL = "asist. 66 — Salud Pública y Salud Mental (Cá
  * con nada que no esté en estos dos PDFs. Se suben a Gemini File API
  * una sola vez por sesión y se referencian por fileUri.
  */
+const VITE_BASE_URL: string =
+  ((import.meta as ImportMeta & { env: Record<string, string | undefined> }).env?.BASE_URL ?? "/");
+
 const PDF_SOURCES = [
-  { name: "01.S1_3_FULL.pdf", path: "/01.S1_3_FULL.pdf" },
-  { name: "02.S4_6_FULL.pdf", path: "/02.S4_6_FULL.pdf" },
+  { name: "01.S1_3_FULL.pdf", path: `${VITE_BASE_URL}01.S1_3_FULL.pdf` },
+  { name: "02.S4_6_FULL.pdf", path: `${VITE_BASE_URL}02.S4_6_FULL.pdf` },
 ] as const;
 
 /**
