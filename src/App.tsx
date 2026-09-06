@@ -328,11 +328,13 @@ export default function App() {
   const [currentQuestion, setCurrentQuestion] = useState<string>("");
   /** Flash que muestra "Guardado ✓" un instante después de bajar el .txt. */
   const [savedFlash, setSavedFlash] = useState<boolean>(false);
-  /** Si está activo, cada Q&A baja un .txt automáticamente sin pedir nada. */
+  /** Si está activo, cada Q&A baja un .txt automáticamente sin pedir nada.
+   *  NOTA: en mobile (Chrome Android, etc.) el browser muestra un diálogo
+   *  "Elegí dónde descargarlo" en cada descarga, así que el auto-save local
+   *  está DESACTIVADO por default — el auto-commit a GitHub es la vía
+   *  silenciosa de persistencia. El usuario puede activarlo desde la UI. */
   const [autoSaveTxt, setAutoSaveTxt] = useState<boolean>(() => {
-    const v = store.get(LS_KEYS.autoSave);
-    // Por defecto ON: el usuario lo pidió así. Solo OFF si explícitamente lo guardó.
-    return v === null ? true : v === "1";
+    return store.get(LS_KEYS.autoSave) === "1";
   });
   /* -------- GitHub auto-commit (SIEMPRE activo) -------- */
   /** PAT del usuario para Contents API. Único dato configurable — se pide una
@@ -1689,7 +1691,7 @@ export default function App() {
                     ? "border-[#e063b8]/70 bg-[#e063b8]/30"
                     : "border-[#5a1a48] bg-[#2a0d28]"
                 }`}
-                title={autoSaveTxt ? "Desactivar auto-guardado" : "Activar auto-guardado"}
+                title={autoSaveTxt ? "Desactivar auto-guardado local" : "Activar auto-guardado local"}
               >
                 <span
                   className={`inline-block h-3.5 w-3.5 rounded-full transition-transform ${
@@ -1699,13 +1701,16 @@ export default function App() {
               </button>
               <div className="min-w-0 flex-1">
                 <p className="font-mono-gem text-[10px] uppercase tracking-widest text-[#c47aae]">
-                  Auto-guardar .txt (local)
+                  Auto-guardar .txt (local, OFF por default)
                 </p>
                 <p className="mt-0.5 text-[11px] leading-relaxed text-[#c47aae]">
-                  Cada Q&amp;A baja un archivo{" "}
-                  <code className="font-mono-gem text-[10px] text-[#f5b8d6]">asis66-YYYY-MM-DD-HH-MM-SS.txt</code> a la
-                  carpeta de descargas. Adicional al auto-commit a GitHub (que
-                  está siempre activo).
+                  Si lo activás, cada Q&amp;A baja un archivo{" "}
+                  <code className="font-mono-gem text-[10px] text-[#f5b8d6]">asis66-YYYY-MM-DD-HH-MM-SS.txt</code>{" "}
+                  a la carpeta de descargas. <b className="text-[#e063b8]">En mobile (Chrome Android,
+                  Samsung Internet, etc.) el browser muestra un diálogo
+                  "Elegí dónde descargarlo" en cada Q&amp;A</b> — por eso está
+                  OFF por default. La persistencia silenciosa la hace el
+                  auto-commit a GitHub (que está siempre activo).
                 </p>
               </div>
             </div>
