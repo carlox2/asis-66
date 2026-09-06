@@ -268,6 +268,121 @@ export function parseAnswer(text: string): ParsedAnswer {
   return { question: "", answer: text.trim() };
 }
 
+/* ============================================================
+ * AUTO-COMMIT A GITHUB (auto-guardado en el repo)
+ * ------------------------------------------------------------
+ * Sube un archivo .txt con el Q&A a una carpeta del repo del
+ * usuario usando la Contents API de GitHub. Pensado para que las
+ * preguntas y respuestas de la sesión queden persistidas online
+ * (en el propio repo del usuario) sin necesidad de backend.
+ *
+ * No requiere SHA porque cada Q&A tiene timestamp único (con
+ * segundos) → siempre es un CREATE, nunca un UPDATE.
+ *
+ * Permisos: el PAT necesita `contents: write` sobre el repo
+ * destino (clásico: scope `repo`; fine-grained: Contents=R/W).
+ * ============================================================ */
+
+export interface GitHubCommitResult {
+  ok: boolean;
+  url?: string;   // HTML URL del archivo en github.com
+  status?: number; // HTTP status code devuelto por GitHub
+  message?: string; // mensaje de error legible si !ok
+}
+
+export interface GitHubCommitOptions {
+  token: string;        // Personal Access Token del usuario
+  repo: string;         // "owner/name" (ej. "carlox2/asis-66")
+  branch?: string;      // default "main"
+  folder?: string;      // default "qa-logs" (se crea si no existe)
+  filename?: string;    // default: asis66-YYYY-MM-DD-HH-MM-SS.txt
+  content: string;      // contenido del .txt (UTF-8)
+  commitMessage?: string; // default: "qa: <filename>"
+}
+
+/**
+ * Sube un archivo .txt al repo vía GitHub Contents API.
+ * Devuelve { ok, url } o { ok: false, status, message } en caso de error.
+ * No lanza excepciones — todos los errores quedan en el resultado.
+ */
+export async function commitQaToGitHub(
+  opts: GitHubCommitOptions
+): Promise<GitHubCommitResult> {
+  const {
+    token,
+    repo,
+    branch = "main",
+    folder = "qa-logs",
+    filename,
+    content,
+    commitMessage,
+  } = opts;
+
+  // Validación mínima
+  const cleanToken = (token ?? "").trim();
+  if (!cleanToken) {
+    return { ok: false, message: "Falta el Personal Access Token." };
+  }
+  const cleanRepo = (repo ?? "").trim().replace(/^\/+|\/+$/g, "");
+  if (!/^[\w.-]+\/[\w.-]+$/.test(cleanRepo)) {
+    return { ok: false, message: "Repo inválido. Formato esperado: owner/name." };
+  }
+  const finalFilename = filename || `asis66-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.txt`;
+  const path = `${folder.replace(/\/+$/g, "")}/${finalFilename}`;
+  const message = commitMessage || `qa: ${finalFilename}`;
+
+  // GitHub Contents API espera el contenido en base64
+  const base64Content = btoa(unescape(encodeURIComponent(content)));
+
+  const url = `https://api.github.com/repos/${cleanRepo}/contents/${path}`;
+
+  try {
+    const res = await fetch(url, {
+      method: "PUT",
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${cleanToken}`,
+        "Content-Type": "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+      body: JSON.stringify({
+        message,
+        content: base64Content,
+        branch,
+      }),
+    });
+
+    if (res.ok) {
+      const data = (await res.json()) as { content?: { html_url?: string } };
+      return {
+        ok: true,
+        url: data?.content?.html_url,
+        status: res.status,
+      };
+    }
+
+    // GitHub devuelve 422 si el path ya existe (mismo segundo). En ese
+    // caso devolvemos ok:false con un mensaje claro, sin propagar la
+    // excepción — la app debe seguir funcionando aunque el commit falle.
+    const errBody = await res.json().catch(() => null) as {
+      message?: string;
+      errors?: { message?: string }[];
+    } | null;
+    const detail = errBody?.message || res.statusText || `HTTP ${res.status}`;
+    const errDetail = errBody?.errors?.[0]?.message;
+    return {
+      ok: false,
+      status: res.status,
+      message: errDetail ? `${detail} — ${errDetail}` : detail,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      message: (err as Error)?.message || "Error de red al contactar GitHub.",
+    };
+  }
+}
+
 /** Extrae un mensaje legible de un error arbitrario (incluido el del SDK). */
 function describeError(err: unknown): string {
   if (typeof err === "string") return err;
