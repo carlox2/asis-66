@@ -344,8 +344,6 @@ export default function App() {
   const [ghCommitMsg, setGhCommitMsg] = useState<string>("");
   /** URL del último archivo subido, para que el usuario pueda hacer click. */
   const [ghLastUrl, setGhLastUrl] = useState<string>("");
-  /** Input controlado del campo PAT, separado del estado persistido hasta que el user confirma. */
-  const [ghTokenInput, setGhTokenInput] = useState<string>("");
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [inputDevices, setInputDevices] = useState<AudioDevice[]>([]);
   const [outputDevices, setOutputDevices] = useState<AudioDevice[]>([]);
@@ -502,6 +500,31 @@ export default function App() {
    * pedirlo en cada sesión, pero acá no tiene sentido. */
   useEffect(() => {
     store.set(LS_KEYS.ghToken, ghToken);
+  }, [ghToken]);
+
+  /* ----- Prompt one-time para el PAT -----
+   * La primera vez que el usuario abre la app, si no hay PAT guardado,
+   * le preguntamos con `window.prompt()` (nativo del navegador, sin
+   * panel en la UI). Después de que pega uno, no vuelve a preguntar.
+   * Si cancela, la app sigue funcionando pero no commitea. El ref
+   * evita que re-pregunte en re-renders. */
+  const ghPromptShownRef = useRef(false);
+  useEffect(() => {
+    if (ghPromptShownRef.current) return;
+    if (ghToken) return;
+    ghPromptShownRef.current = true;
+    // Pequeño delay para que la app termine de cargar antes de abrir el prompt
+    const t = setTimeout(() => {
+      const entered = window.prompt(
+        "Para auto-guardar tus Q&A en GitHub, pegá tu Personal Access Token (scope 'repo' o 'contents: write').\n" +
+          "Queda guardado en este navegador; no se vuelve a pedir.\n\n" +
+          "Si querés saltear este paso, apretá Cancelar."
+      );
+      if (entered && entered.trim()) {
+        setGhToken(entered.trim());
+      }
+    }, 600);
+    return () => clearTimeout(t);
   }, [ghToken]);
 
   /* ----- Limpieza total al desmontar ----- */
@@ -1348,52 +1371,6 @@ export default function App() {
       <main className="mx-auto grid max-w-6xl gap-4 px-4 py-5 sm:px-6 lg:grid-cols-[1fr_360px]">
         {/* Columna izquierda: consola + respuesta */}
         <div className="flex min-w-0 flex-col gap-4">
-          {/* Banner one-time para el PAT de GitHub.
-              Aparece SOLO si no hay token guardado. Una vez que se pega y
-              se guarda, desaparece para siempre. Sin este input, el
-              auto-commit a GitHub (siempre activo) no puede autenticarse. */}
-          {!ghToken && (
-            <div className="flex flex-col gap-2 rounded-xl border border-[#e063b8]/40 bg-[#2a0d28] px-4 py-3 sm:flex-row sm:items-center">
-              <div className="min-w-0 flex-1">
-                <p className="font-mono-gem text-[10px] uppercase tracking-widest text-[#e063b8]">
-                  Auto-commit a GitHub — pegá tu PAT una vez
-                </p>
-                <p className="mt-0.5 text-[11px] leading-relaxed text-[#c47aae]">
-                  Cada Q&amp;A se sube a <code className="font-mono-gem text-[10px] text-[#f5b8d6]">{GH_CONFIG.repo}/tree/{GH_CONFIG.branch}/{GH_CONFIG.folder}</code>.
-                  Queda guardado en este navegador; no se vuelve a pedir.
-                </p>
-              </div>
-              <div className="flex gap-2 sm:shrink-0">
-                <input
-                  type="password"
-                  value={ghTokenInput}
-                  onChange={(e) => setGhTokenInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && ghTokenInput.trim()) {
-                      setGhToken(ghTokenInput.trim());
-                      setGhTokenInput("");
-                    }
-                  }}
-                  placeholder="ghp_… o github_pat_…"
-                  className="min-w-0 flex-1 rounded-lg border border-[#5a1a48] bg-[#421a36] px-3 py-2 font-mono-gem text-xs text-[#f5b8d6] placeholder:text-[#c47aae]/50 outline-none transition-colors focus:border-[#b94586]/60 sm:w-56"
-                />
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (ghTokenInput.trim()) {
-                      setGhToken(ghTokenInput.trim());
-                      setGhTokenInput("");
-                    }
-                  }}
-                  disabled={!ghTokenInput.trim()}
-                  className="ctrl-btn shrink-0 rounded-lg border border-[#b94586]/50 bg-[#b94586]/10 px-3.5 py-2 text-xs font-semibold text-[#b94586] transition-colors hover:bg-[#b94586]/20 disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  Guardar
-                </button>
-              </div>
-            </div>
-          )}
-
           {/* Consola de grabación */}
           <section className="rounded-xl border border-[#5a1a48] bg-[#2a0d28] p-4 sm:p-5">
             <div className="mb-3 flex items-center justify-between gap-3">

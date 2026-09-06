@@ -153,6 +153,11 @@ historial de git, considerá un `Squash and merge` o ignorar el folder en
 
 ## 4. Integración en la UI
 
+Hay **dos variantes** según qué tan "invisible" querés que sea la
+configuración para el usuario final.
+
+### 4.1. Variante "panel de configuración" (configurable)
+
 Mínimo necesario en cualquier frontend:
 
 1. **Tres inputs en el panel de configuración:**
@@ -175,31 +180,103 @@ Mínimo necesario en cualquier frontend:
 5. **Refs espejo** (`useRef`) del estado para que el callback del handler
    vea siempre el valor actual sin re-crearse en cada render.
 
-### Ejemplo mínimo en React
+### 4.2. Variante "cero config" (recomendada para uso personal) ✅
+
+Esta es la que usa `asis-66` y la que un agente random debería preferir
+para una herramienta personal. El usuario no toca NADA de GitHub: ni
+panel, ni toggle, ni inputs de repo/branch/carpeta.
+
+- **Repo / branch / carpeta:** hardcodeados como **constantes** en el
+  código. Para cambiar el destino, se edita la constante y se redeploya.
+- **PAT:** el único dato que tiene que aportar el usuario. Se pide
+  **una sola vez** con `window.prompt()` nativo del navegador la primera
+  vez que abre la app. Después queda en `localStorage` y no se vuelve
+  a preguntar.
+- **Auto-commit:** siempre activo. No hay toggle. El handler llama a
+  `commitQaToGitHub()` si hay PAT; si no hay, sigue funcionando y
+  simplemente no commitea.
+
+#### Ejemplo en React
 
 ```tsx
+// src/lib/githubConfig.ts
+export const GH_CONFIG = {
+  repo: "owner/repo",     // EDITABLE POR CÓDIGO
+  branch: "main",         // EDITABLE POR CÓDIGO
+  folder: "qa-logs",      // EDITABLE POR CÓDIGO
+} as const;
+
+// src/App.tsx
+import { useState, useEffect, useRef } from "react";
 import { commitQaToGitHub } from "./lib/githubCommit";
+import { GH_CONFIG } from "./lib/githubConfig";
 
-// refs espejo
+const LS_GH_TOKEN = "gem-gh-token";
+
+// 1) Estado: solo el PAT (el resto está hardcodeado)
+const [ghToken, setGhToken] = useState<string>(
+  () => localStorage.getItem(LS_GH_TOKEN) ?? ""
+);
 const ghTokenRef = useRef(ghToken);
-const ghRepoRef = useRef(ghRepo);
-const ghFolderRef = useRef(ghFolder);
-const ghAutoCommitRef = useRef(ghAutoCommit);
 ghTokenRef.current = ghToken;
-ghRepoRef.current = ghRepo;
-ghFolderRef.current = ghFolder;
-ghAutoCommitRef.current = ghAutoCommit;
 
-// en el handler, después de procesar la respuesta
-if (ghAutoCommitRef.current && ghTokenRef.current) {
-  void commitQaToGitHub({
-    token: ghTokenRef.current,
-    repo: ghRepoRef.current,
-    folder: ghFolderRef.current,
-    content: formatAsTxt(qa),
-  }).then((r) => console.log(r.ok ? "ok" : r.message));
+// 2) Persistencia
+useEffect(() => {
+  localStorage.setItem(LS_GH_TOKEN, ghToken);
+}, [ghToken]);
+
+// 3) Prompt one-time al montar la app
+const ghPromptShownRef = useRef(false);
+useEffect(() => {
+  if (ghPromptShownRef.current) return;
+  if (ghToken) return; // ya hay uno guardado
+  ghPromptShownRef.current = true;
+  const t = setTimeout(() => {
+    const entered = window.prompt(
+      "Para auto-guardar tus Q&A en GitHub, pegá tu Personal Access Token " +
+        "(scope 'repo' o 'contents: write').\n" +
+        "Queda guardado en este navegador; no se vuelve a pedir.\n\n" +
+        "Si querés saltear este paso, apretá Cancelar."
+    );
+    if (entered && entered.trim()) {
+      setGhToken(entered.trim());
+    }
+  }, 600);
+  return () => clearTimeout(t);
+}, [ghToken]);
+
+// 4) Trigger en el handler de respuesta
+async function onAnswerReady(qa: { question: string; text: string }) {
+  if (ghTokenRef.current) {
+    void commitQaToGitHub({
+      token: ghTokenRef.current,
+      repo: GH_CONFIG.repo,
+      branch: GH_CONFIG.branch,
+      folder: GH_CONFIG.folder,
+      content: formatAsTxt(qa),
+    });
+  }
 }
 ```
+
+#### ¿Por qué `window.prompt()` y no un banner en la UI?
+
+- Es **nativo del navegador**: cero HTML/CSS para mantener.
+- Es **bloqueante**: el usuario no puede ignorarlo y olvidarse.
+- Solo aparece **una vez por navegador** (la primera vez, si no hay
+  PAT). Después desaparece.
+- Si el usuario cancela, la app sigue funcionando (sin auto-commit).
+  No es invasivo.
+- Si querés re-configurar, el usuario borra la clave de localStorage
+  manualmente y vuelve a aparecer.
+
+#### ¿Por qué NO hardcodear el PAT en el código?
+
+- Si el repo es público, queda visible para cualquiera.
+- Aunque el repo sea privado, el bundle JS se sirve al público
+  (cualquiera puede abrir DevTools y leerlo).
+- Cualquier persona con el URL del sitio podría extraer el PAT y
+  abusar de tu cuenta de GitHub. **Nunca** hardcodear secrets.
 
 ---
 
@@ -301,7 +378,16 @@ sino solo confirmar manualmente.
 ## 8. Anti-patrones a evitar
 
 - ❌ **Guardar el PAT en código fuente** o en variables de entorno del
-  build. Tiene que ir a localStorage del usuario.
+  build (ej. `VITE_PAT_KEY=ghp_...`). Aunque el repo sea privado, el
+  bundle JS se sirve al público — cualquiera puede abrir DevTools,
+  buscar `ghp_` y extraer el token. Tiene que ir a localStorage del
+  usuario. **Nunca** hardcodear secrets en el frontend.
+- ❌ **Confiar en que los GitHub Secrets (`Settings → Secrets`) son
+  accesibles desde el frontend.** No. Están encriptados y solo se
+  desencriptan dentro de GitHub Actions (en el runner). Un sitio
+  estático no puede leerlos en runtime. Si necesitás secrets en
+  runtime, necesitás un backend (Cloudflare Workers, Vercel
+  Functions, Supabase, etc.).
 - ❌ **Hacer PUT sin codificar a base64.** GitHub rechaza el PUT si el
   `content` no está en base64.
 - ❌ **Manejar el 422 como crash.** Es esperable (colisión de path).
@@ -314,12 +400,32 @@ sino solo confirmar manualmente.
 - ❌ **Asumir que `getCurrentQuestion` viene siempre.** Si el modelo no
   devuelve los marcadores, la transcripción viene vacía. Mostrar
   "(sin transcripción)" en el .txt, no romper.
+- ❌ **Re-preguntar el PAT en cada mount.** Usar un `useRef` para
+  garantizar que el `window.prompt()` se dispare una sola vez por
+  sesión de navegador. Si vuelve a aparecer en cada refresh, es
+  ruido.
 
 ---
 
 ## 9. Checklist de adopción
 
-Para integrar esta receta en otro repo:
+### Variante "cero config" (recomendada para uso personal)
+
+- [ ] Copiar `commitQaToGitHub` y los tipos a `src/lib/`
+- [ ] Crear constante `GH_CONFIG` con `repo`, `branch`, `folder`
+      hardcodeados
+- [ ] Agregar 1 clave a `localStorage` (solo el PAT)
+- [ ] Persistir el PAT en `localStorage` con un useEffect
+- [ ] Agregar 1 useEffect al montar la app que dispare `window.prompt()`
+      UNA sola vez si no hay PAT guardado (usar `useRef` para evitar
+      re-disparos en re-renders)
+- [ ] Agregar 1 ref espejo del PAT para el callback del handler
+- [ ] Llamar `commitQaToGitHub` fire-and-forget en el handler de
+      respuesta si hay PAT, usando los valores de `GH_CONFIG`
+- [ ] Mostrar un indicador de estado (committing / ok / error) en la UI
+- [ ] Documentar el setup en el README del proyecto
+
+### Variante "panel de configuración" (configurable)
 
 - [ ] Copiar `commitQaToGitHub` y los tipos a `src/lib/`
 - [ ] Agregar 4 claves a `localStorage` (PAT, repo, branch, folder,
