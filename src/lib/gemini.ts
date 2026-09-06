@@ -139,6 +139,22 @@ Es un requisito estricto que, al desarrollar los temas, mantengas una distinció
 export const KNOWLEDGE_BASE_NOTE =
   "Base de conocimiento: 01.S1_3_FULL.pdf + 02.S4_6_FULL.pdf (subidos a Gemini File API).";
 
+/* ============================================================
+ * GITHUB AUTO-COMMIT (config hardcoded, no UI)
+ * ------------------------------------------------------------
+ * El auto-commit a GitHub es SIEMPRE activo — no hay toggle.
+ * El usuario solo necesita pegar su PAT una vez (banner one-time
+ * si no está en localStorage). Todo lo demás va por constante.
+ *
+ * Si en el futuro se quiere cambiar repo/branch/carpeta, se edita
+ * acá directamente y se redeploya.
+ * ============================================================ */
+export const GH_CONFIG = {
+  repo: "carlox2/asis-66",
+  branch: "main",
+  folder: "qa-logs",
+} as const;
+
 /**
  * Lee la API key desde la variable de entorno de Vite.
  * Se mantiene como fallback; la app prefiere siempre la key que el usuario

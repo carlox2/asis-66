@@ -44,6 +44,7 @@ import {
   commitQaToGitHub,
   GEMINI_API_KEY,
   GEMINI_MODEL,
+  GH_CONFIG,
   SYSTEM_PROMPT,
   pickMimeType,
   parseAnswer,
@@ -103,10 +104,6 @@ const LS_KEYS = {
   history: "gem-history",
   autoSave: "gem-auto-save",
   ghToken: "gem-gh-token",
-  ghRepo: "gem-gh-repo",
-  ghAutoCommit: "gem-gh-auto-commit",
-  ghBranch: "gem-gh-branch",
-  ghFolder: "gem-gh-folder",
 } as const;
 
 /** Máximo de Q&A que se guardan en la bitácora persistente. */
@@ -337,17 +334,11 @@ export default function App() {
     // Por defecto ON: el usuario lo pidió así. Solo OFF si explícitamente lo guardó.
     return v === null ? true : v === "1";
   });
-  /* -------- GitHub auto-commit -------- */
-  /** PAT del usuario para Contents API. NUNCA se loguea ni se muestra. */
+  /* -------- GitHub auto-commit (SIEMPRE activo) -------- */
+  /** PAT del usuario para Contents API. Único dato configurable — se pide una
+   *  sola vez en un banner mínimo, después queda persistido en localStorage.
+   *  NUNCA se loguea ni se muestra. */
   const [ghToken, setGhToken] = useState<string>(() => store.get(LS_KEYS.ghToken) ?? "");
-  /** Repo destino, formato "owner/name". Default razonable para el usuario actual. */
-  const [ghRepo, setGhRepo] = useState<string>(() => store.get(LS_KEYS.ghRepo) ?? "carlox2/asis-66");
-  /** Branch destino. */
-  const [ghBranch, setGhBranch] = useState<string>(() => store.get(LS_KEYS.ghBranch) ?? "main");
-  /** Carpeta destino dentro del repo. Se crea sola si no existe. */
-  const [ghFolder, setGhFolder] = useState<string>(() => store.get(LS_KEYS.ghFolder) ?? "qa-logs");
-  /** Si está activo, cada Q&A se commitea como .txt al repo. */
-  const [ghAutoCommit, setGhAutoCommit] = useState<boolean>(() => store.get(LS_KEYS.ghAutoCommit) === "1");
   /** Estado del último intento de commit: "idle" | "ok" | "error". */
   const [ghCommitStatus, setGhCommitStatus] = useState<"idle" | "committing" | "ok" | "error">("idle");
   const [ghCommitMsg, setGhCommitMsg] = useState<string>("");
@@ -390,21 +381,13 @@ export default function App() {
   /** Mirror del flag de auto-save para que el callback del handler de
    *  respuesta siempre vea el valor actual sin re-crearse. */
   const autoSaveTxtRef = useRef(autoSaveTxt);
-  /** Mirrors de config de GitHub para el mismo motivo. */
+  /** Mirror del PAT de GitHub para el mismo motivo. */
   const ghTokenRef = useRef(ghToken);
-  const ghRepoRef = useRef(ghRepo);
-  const ghBranchRef = useRef(ghBranch);
-  const ghFolderRef = useRef(ghFolder);
-  const ghAutoCommitRef = useRef(ghAutoCommit);
 
   keyRef.current = savedKey;
   voicesRef.current = voices;
   autoSaveTxtRef.current = autoSaveTxt;
   ghTokenRef.current = ghToken;
-  ghRepoRef.current = ghRepo;
-  ghBranchRef.current = ghBranch;
-  ghFolderRef.current = ghFolder;
-  ghAutoCommitRef.current = ghAutoCommit;
 
   /** Cambia la fase en el ref y en el estado a la vez. */
   const goPhase = useCallback((p: Phase) => {
@@ -513,25 +496,13 @@ export default function App() {
     store.set(LS_KEYS.autoSave, autoSaveTxt ? "1" : "0");
   }, [autoSaveTxt]);
 
-  /* ----- Persistencia de config de GitHub -----
+  /* ----- Persistencia del PAT de GitHub -----
    * El PAT se persiste tal cual: el usuario es el único dueño de su
    * navegador y la app es personal. Para un uso público habría que
    * pedirlo en cada sesión, pero acá no tiene sentido. */
   useEffect(() => {
     store.set(LS_KEYS.ghToken, ghToken);
   }, [ghToken]);
-  useEffect(() => {
-    store.set(LS_KEYS.ghRepo, ghRepo);
-  }, [ghRepo]);
-  useEffect(() => {
-    store.set(LS_KEYS.ghBranch, ghBranch);
-  }, [ghBranch]);
-  useEffect(() => {
-    store.set(LS_KEYS.ghFolder, ghFolder);
-  }, [ghFolder]);
-  useEffect(() => {
-    store.set(LS_KEYS.ghAutoCommit, ghAutoCommit ? "1" : "0");
-  }, [ghAutoCommit]);
 
   /* ----- Limpieza total al desmontar ----- */
   useEffect(() => {
@@ -1056,11 +1027,10 @@ export default function App() {
         downloadTxt(`asis66-${timestampForFilename()}.txt`, formatQAToTxt(qa));
       }
 
-      // Auto-commit a GitHub: si está activo y hay token configurado,
-      // subimos el .txt al repo en la carpeta configurada. No bloquea
-      // la respuesta — el commit corre en background y actualizamos
-      // un status en la UI.
-      if (ghAutoCommitRef.current && ghTokenRef.current) {
+      // Auto-commit a GitHub: SIEMPRE activo, no hay toggle. Si hay PAT
+      // en localStorage, sube el .txt al repo (GH_CONFIG) sin preguntar.
+      // Si no hay PAT, simplemente no commitea (la respuesta sigue OK).
+      if (ghTokenRef.current) {
         setGhCommitStatus("committing");
         setGhCommitMsg("Subiendo a GitHub…");
         const qa = {
@@ -1074,9 +1044,9 @@ export default function App() {
         // errores se reflejan en el status pero no rompen la app.
         void commitQaToGitHub({
           token: ghTokenRef.current,
-          repo: ghRepoRef.current,
-          branch: ghBranchRef.current,
-          folder: ghFolderRef.current,
+          repo: GH_CONFIG.repo,
+          branch: GH_CONFIG.branch,
+          folder: GH_CONFIG.folder,
           filename,
           content,
         }).then((result) => {
@@ -1378,6 +1348,52 @@ export default function App() {
       <main className="mx-auto grid max-w-6xl gap-4 px-4 py-5 sm:px-6 lg:grid-cols-[1fr_360px]">
         {/* Columna izquierda: consola + respuesta */}
         <div className="flex min-w-0 flex-col gap-4">
+          {/* Banner one-time para el PAT de GitHub.
+              Aparece SOLO si no hay token guardado. Una vez que se pega y
+              se guarda, desaparece para siempre. Sin este input, el
+              auto-commit a GitHub (siempre activo) no puede autenticarse. */}
+          {!ghToken && (
+            <div className="flex flex-col gap-2 rounded-xl border border-[#e063b8]/40 bg-[#2a0d28] px-4 py-3 sm:flex-row sm:items-center">
+              <div className="min-w-0 flex-1">
+                <p className="font-mono-gem text-[10px] uppercase tracking-widest text-[#e063b8]">
+                  Auto-commit a GitHub — pegá tu PAT una vez
+                </p>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-[#c47aae]">
+                  Cada Q&amp;A se sube a <code className="font-mono-gem text-[10px] text-[#f5b8d6]">{GH_CONFIG.repo}/tree/{GH_CONFIG.branch}/{GH_CONFIG.folder}</code>.
+                  Queda guardado en este navegador; no se vuelve a pedir.
+                </p>
+              </div>
+              <div className="flex gap-2 sm:shrink-0">
+                <input
+                  type="password"
+                  value={ghTokenInput}
+                  onChange={(e) => setGhTokenInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && ghTokenInput.trim()) {
+                      setGhToken(ghTokenInput.trim());
+                      setGhTokenInput("");
+                    }
+                  }}
+                  placeholder="ghp_… o github_pat_…"
+                  className="min-w-0 flex-1 rounded-lg border border-[#5a1a48] bg-[#421a36] px-3 py-2 font-mono-gem text-xs text-[#f5b8d6] placeholder:text-[#c47aae]/50 outline-none transition-colors focus:border-[#b94586]/60 sm:w-56"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (ghTokenInput.trim()) {
+                      setGhToken(ghTokenInput.trim());
+                      setGhTokenInput("");
+                    }
+                  }}
+                  disabled={!ghTokenInput.trim()}
+                  className="ctrl-btn shrink-0 rounded-lg border border-[#b94586]/50 bg-[#b94586]/10 px-3.5 py-2 text-xs font-semibold text-[#b94586] transition-colors hover:bg-[#b94586]/20 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Guardar
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Consola de grabación */}
           <section className="rounded-xl border border-[#5a1a48] bg-[#2a0d28] p-4 sm:p-5">
             <div className="mb-3 flex items-center justify-between gap-3">
@@ -1706,169 +1722,71 @@ export default function App() {
               </button>
               <div className="min-w-0 flex-1">
                 <p className="font-mono-gem text-[10px] uppercase tracking-widest text-[#c47aae]">
-                  Auto-guardar .txt
+                  Auto-guardar .txt (local)
                 </p>
                 <p className="mt-0.5 text-[11px] leading-relaxed text-[#c47aae]">
                   Cada Q&amp;A baja un archivo{" "}
                   <code className="font-mono-gem text-[10px] text-[#f5b8d6]">asis66-YYYY-MM-DD-HH-MM-SS.txt</code> a la
-                  carpeta de descargas. Sin clicks ni avisos. La carpeta destino
-                  se configura en el navegador.
+                  carpeta de descargas. Adicional al auto-commit a GitHub (que
+                  está siempre activo).
                 </p>
               </div>
             </div>
 
-            {/* Auto-commit a GitHub: persistencia online en el repo del usuario */}
-            <details className="group mt-4 rounded-lg border border-[#5a1a48] bg-[#421a36]">
-              <summary className="flex cursor-pointer select-none items-center gap-2.5 px-3 py-2.5 font-mono-gem text-[10px] uppercase tracking-widest text-[#c47aae] transition-colors hover:text-[#f5b8d6]">
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={ghAutoCommit}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setGhAutoCommit((s) => !s);
-                  }}
-                  className={`ctrl-btn relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
-                    ghAutoCommit
-                      ? "border-[#e063b8]/70 bg-[#e063b8]/30"
-                      : "border-[#5a1a48] bg-[#2a0d28]"
-                  }`}
-                  title={ghAutoCommit ? "Desactivar auto-commit" : "Activar auto-commit"}
-                  onClickCapture={(e) => e.stopPropagation()}
-                >
-                  <span
-                    className={`inline-block h-3.5 w-3.5 rounded-full transition-transform ${
-                      ghAutoCommit ? "translate-x-4 bg-[#f278c4]" : "translate-x-0.5 bg-[#c47aae]"
-                    }`}
-                  />
-                </button>
-                <span>Auto-commit a GitHub</span>
-                {ghCommitStatus !== "idle" && (
-                  <span
-                    className={`ml-auto font-mono-gem text-[10px] normal-case tracking-normal ${
-                      ghCommitStatus === "committing"
-                        ? "text-[#c47aae]"
-                        : ghCommitStatus === "ok"
-                          ? "text-[#b89476]"
-                          : "text-[#e063b8]"
-                    }`}
-                  >
-                    {ghCommitMsg}
-                  </span>
-                )}
-              </summary>
-
-              <div className="space-y-3 border-t border-[#5a1a48] px-3 py-3">
-                <p className="text-[11px] leading-relaxed text-[#c47aae]">
-                  Sube cada Q&amp;A como{" "}
-                  <code className="font-mono-gem text-[10px] text-[#f5b8d6]">{ghFolder || "qa-logs"}/asis66-YYYY-MM-DD-HH-MM-SS.txt</code>{" "}
-                  al repo. Aparecen en{" "}
-                  <a
-                    className="underline decoration-dotted hover:text-[#f278c4]"
-                    href={`https://github.com/${ghRepo || "owner/repo"}/tree/${ghBranch || "main"}/${ghFolder || "qa-logs"}`}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    github.com/{ghRepo || "owner/repo"}/tree/{ghBranch || "main"}/{ghFolder || "qa-logs"}
-                  </a>
-                  .
-                </p>
-
-                <label className="block">
-                  <span className="mb-1 block font-mono-gem text-[10px] uppercase tracking-widest text-[#c47aae]">
-                    Personal Access Token (con scope <code className="text-[#f5b8d6]">repo</code> o{" "}
-                    <code className="text-[#f5b8d6]">contents: write</code>)
-                  </span>
-                  <div className="flex gap-2">
-                    <input
-                      type="password"
-                      value={ghTokenInput}
-                      onChange={(e) => setGhTokenInput(e.target.value)}
-                      placeholder={ghToken ? "•••••••• (guardado)" : "ghp_… o github_pat_…"}
-                      className="min-w-0 flex-1 rounded-lg border border-[#5a1a48] bg-[#2a0d28] px-3 py-2 font-mono-gem text-xs text-[#f5b8d6] placeholder:text-[#c47aae]/50 outline-none transition-colors focus:border-[#b94586]/60"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setGhToken(ghTokenInput.trim());
-                        setGhTokenInput("");
-                      }}
-                      disabled={!ghTokenInput.trim()}
-                      className="ctrl-btn rounded-lg border border-[#b94586]/50 bg-[#b94586]/10 px-3.5 py-2 text-xs font-semibold text-[#b94586] transition-colors hover:bg-[#b94586]/20 disabled:cursor-not-allowed disabled:opacity-40"
+            {/* Link al repo + estado del último commit (NO es un panel: solo info.
+                No hay toggles, no hay inputs. El auto-commit a GitHub está
+                siempre activo y se configura por código en GH_CONFIG. */}
+            {ghToken && (
+              <div className="mt-3 flex flex-col gap-1 rounded-lg border border-[#5a1a48] bg-[#421a36] px-3 py-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="font-mono-gem text-[10px] uppercase tracking-widest text-[#c47aae]">
+                    Auto-commit a GitHub
+                  </p>
+                  {ghCommitStatus !== "idle" && (
+                    <span
+                      className={`font-mono-gem text-[10px] normal-case tracking-normal ${
+                        ghCommitStatus === "committing"
+                          ? "text-[#c47aae]"
+                          : ghCommitStatus === "ok"
+                            ? "text-[#b89476]"
+                            : "text-[#e063b8]"
+                      }`}
                     >
-                      Guardar
-                    </button>
-                  </div>
-                  {ghToken && (
-                    <button
-                      type="button"
-                      onClick={() => setGhToken("")}
-                      className="mt-1.5 font-mono-gem text-[10px] uppercase tracking-widest text-[#a14d80] underline decoration-dotted hover:text-[#f278c4]"
-                    >
-                      Borrar PAT guardado
-                    </button>
+                      {ghCommitMsg}
+                    </span>
                   )}
-                </label>
-
-                <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-                  <label className="block">
-                    <span className="mb-1 block font-mono-gem text-[10px] uppercase tracking-widest text-[#c47aae]">
-                      Repo
-                    </span>
-                    <input
-                      type="text"
-                      value={ghRepo}
-                      onChange={(e) => setGhRepo(e.target.value)}
-                      placeholder="owner/name"
-                      className="w-full rounded-lg border border-[#5a1a48] bg-[#2a0d28] px-3 py-2 font-mono-gem text-xs text-[#f5b8d6] placeholder:text-[#c47aae]/50 outline-none transition-colors focus:border-[#b94586]/60"
-                    />
-                  </label>
-                  <label className="block">
-                    <span className="mb-1 block font-mono-gem text-[10px] uppercase tracking-widest text-[#c47aae]">
-                      Branch
-                    </span>
-                    <input
-                      type="text"
-                      value={ghBranch}
-                      onChange={(e) => setGhBranch(e.target.value)}
-                      placeholder="main"
-                      className="w-full rounded-lg border border-[#5a1a48] bg-[#2a0d28] px-3 py-2 font-mono-gem text-xs text-[#f5b8d6] placeholder:text-[#c47aae]/50 outline-none transition-colors focus:border-[#b94586]/60"
-                    />
-                  </label>
-                  <label className="block">
-                    <span className="mb-1 block font-mono-gem text-[10px] uppercase tracking-widest text-[#c47aae]">
-                      Carpeta
-                    </span>
-                    <input
-                      type="text"
-                      value={ghFolder}
-                      onChange={(e) => setGhFolder(e.target.value)}
-                      placeholder="qa-logs"
-                      className="w-full rounded-lg border border-[#5a1a48] bg-[#2a0d28] px-3 py-2 font-mono-gem text-xs text-[#f5b8d6] placeholder:text-[#c47aae]/50 outline-none transition-colors focus:border-[#b94586]/60"
-                    />
-                  </label>
                 </div>
-
+                <a
+                  href={`https://github.com/${GH_CONFIG.repo}/tree/${GH_CONFIG.branch}/${GH_CONFIG.folder}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[11px] leading-relaxed text-[#c47aae] underline decoration-dotted hover:text-[#f278c4]"
+                >
+                  github.com/{GH_CONFIG.repo}/tree/{GH_CONFIG.branch}/{GH_CONFIG.folder} ↗
+                </a>
                 {ghLastUrl && ghCommitStatus === "ok" && (
                   <a
                     href={ghLastUrl}
                     target="_blank"
                     rel="noreferrer"
-                    className="block break-all font-mono-gem text-[10px] text-[#b89476] underline decoration-dotted hover:text-[#f278c4]"
+                    className="break-all font-mono-gem text-[10px] text-[#b89476] underline decoration-dotted hover:text-[#f278c4]"
                   >
-                    Ver último archivo en GitHub ↗
+                    Último archivo subido ↗
                   </a>
                 )}
-
-                <p className="text-[10px] leading-relaxed text-[#a14d80]">
-                  ⚠ El PAT queda en localStorage de este navegador. No uses esta
-                  compu para acceder a otros sitios con la misma sesión. Para un
-                  PAT fine-grained, limitá los permisos a <em>Contents: Read and write</em>{" "}
-                  sobre este repo únicamente.
-                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (confirm("¿Borrar el PAT guardado? Las respuestas ya no se commitean a GitHub hasta que pegues uno nuevo.")) {
+                      setGhToken("");
+                    }
+                  }}
+                  className="mt-1 self-start font-mono-gem text-[10px] uppercase tracking-widest text-[#a14d80] underline decoration-dotted hover:text-[#f278c4]"
+                >
+                  Cambiar / borrar PAT
+                </button>
               </div>
-            </details>
+            )}
 
             <div className="mt-4 grid grid-cols-2 gap-2">
               <div className="rounded-lg border border-[#5a1a48] bg-[#421a36] px-3 py-2.5">
