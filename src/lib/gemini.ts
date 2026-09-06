@@ -99,7 +99,14 @@ async function buildKnowledgeBaseParts(
 ): Promise<{ fileData: { fileUri: string; mimeType: string } }[]> {
   const parts: { fileData: { fileUri: string; mimeType: string } }[] = [];
   for (const src of PDF_SOURCES) {
-    onProgress?.(`Subiendo ${src.name} a Gemini…`);
+    // Avisamos distinto según haya caché o no, para no mentirle al usuario
+    // cuando el PDF ya está subido y solo se reusa el fileUri.
+    const cached = readCachedUri(src.name) !== null;
+    onProgress?.(
+      cached
+        ? `Reusando ${src.name} en caché (sin resubir)…`
+        : `Subiendo ${src.name} a Gemini…`
+    );
     const uri = await ensurePdfUploaded(ai, src.name, src.path);
     parts.push({ fileData: { fileUri: uri, mimeType: "application/pdf" } });
   }
@@ -226,6 +233,41 @@ export function sanitizeResponseText(text: string): string {
   return t.trim();
 }
 
+/**
+ * Resultado de separar la respuesta de Gemini en transcripción + respuesta.
+ * `question` queda vacío si el modelo no devolvió los marcadores.
+ */
+export interface ParsedAnswer {
+  question: string;
+  answer: string;
+}
+
+/**
+ * Separa una respuesta de Gemini en {question, answer} según los marcadores
+ * <PREGUNTA>...</PREGUNTA> y <RESPUESTA>...</RESPUESTA>. Si el modelo no los
+ * devolvió (fallback), trata todo el texto como respuesta y deja `question`
+ * vacío. La regex es case-insensitive y tolerante a saltos de línea.
+ */
+export function parseAnswer(text: string): ParsedAnswer {
+  if (!text) return { question: "", answer: "" };
+  const m = text.match(
+    /<PREGUNTA>([\s\S]*?)<\/PREGUNTA>\s*<RESPUESTA>([\s\S]*?)<\/RESPUESTA>/i
+  );
+  if (m) {
+    return {
+      question: m[1].trim(),
+      answer: m[2].trim(),
+    };
+  }
+  // Fallback: puede que el modelo haya escrito solo "Pregunta: ... Respuesta: ..."
+  // en prosa. Hacemos un split defensivo por la palabra "Respuesta:" si aparece.
+  const loose = text.split(/^(?:\s*)?(?:Respuesta|R)\s*:\s*/im);
+  if (loose.length >= 2) {
+    return { question: loose[0].trim(), answer: loose.slice(1).join("\n").trim() };
+  }
+  return { question: "", answer: text.trim() };
+}
+
 /** Extrae un mensaje legible de un error arbitrario (incluido el del SDK). */
 function describeError(err: unknown): string {
   if (typeof err === "string") return err;
@@ -332,8 +374,12 @@ export async function askGemini(
         { inlineData: { mimeType, data: base64Audio } },
         {
           text:
-            "Escuchá el audio adjunto y respondé según las instrucciones del sistema. " +
-            "Tu respuesta debe fundamentarse exclusivamente en los dos PDFs cargados " +
+            "Escuchá el audio adjunto. " +
+            "Antes de responder, transcribí textualmente lo que dije, encerrado entre los marcadores " +
+            "<PREGUNTA> y </PREGUNTA> (en una sola línea, sin saltos). " +
+            "Inmediatamente después, brindá tu respuesta académica según las instrucciones del sistema, " +
+            "encerrada entre los marcadores <RESPUESTA> y </RESPUESTA>. " +
+            "Fundamentá exclusivamente en los dos PDFs cargados " +
             "(01.S1_3_FULL.pdf y 02.S4_6_FULL.pdf).",
         },
       ],

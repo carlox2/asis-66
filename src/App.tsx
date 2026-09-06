@@ -45,6 +45,7 @@ import {
   GEMINI_MODEL,
   SYSTEM_PROMPT,
   pickMimeType,
+  parseAnswer,
   sanitizeResponseText,
 } from "./lib/gemini";
 import {
@@ -74,7 +75,8 @@ type Phase =
 interface HistoryItem {
   id: number;
   time: string;
-  text: string;
+  question: string; // transcripción de la pregunta (puede estar vacía si Gemini no devolvió marcadores)
+  text: string;     // respuesta académica
 }
 
 /** Lee/escribe localStorage sin romper si el navegador lo bloquea. */
@@ -95,6 +97,43 @@ const store = {
   },
 };
 
+/** Claves de localStorage que usa la app. Centralizadas para no typo'pearlas. */
+const LS_KEYS = {
+  history: "gem-history",
+} as const;
+
+/** Máximo de Q&A que se guardan en la bitácora persistente. */
+const HISTORY_MAX = 50;
+
+/** Carga la bitácora persistida. Devuelve [] si no hay, está corrupta o el storage está bloqueado. */
+function loadHistory(): HistoryItem[] {
+  const raw = store.get(LS_KEYS.history);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    // Filtramos items malformados y descartamos los viejos que no tengan `question`
+    // (compatibilidad hacia atrás: la primera versión guardaba solo `text`).
+    return parsed
+      .filter(
+        (x): x is HistoryItem =>
+          x &&
+          typeof x === "object" &&
+          typeof x.id === "number" &&
+          typeof x.time === "string" &&
+          typeof x.text === "string"
+      )
+      .map((x) => ({ question: typeof x.question === "string" ? x.question : "", ...x }))
+      .slice(0, HISTORY_MAX);
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory(items: HistoryItem[]): void {
+  store.set(LS_KEYS.history, JSON.stringify(items.slice(0, HISTORY_MAX)));
+}
+
 function formatTime(ms: number): string {
   const total = Math.max(0, ms);
   const m = Math.floor(total / 60000);
@@ -106,6 +145,73 @@ function formatTime(ms: number): string {
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   return `${(n / 1024).toFixed(1)} KB`;
+}
+
+/** Devuelve un timestamp tipo "2026-09-06-18-10" para nombres de archivo. */
+function timestampForFilename(d: Date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}-${pad(d.getMinutes())}`;
+}
+
+/** Dispara la descarga de un .txt con el nombre y contenido dados. */
+function downloadTxt(filename: string, content: string): void {
+  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Liberamos el object URL en el siguiente tick (después de que el navegador
+  // arrancó la descarga) para no cortar el stream.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** Formato del .txt de un Q&A individual. */
+function formatQAToTxt(qa: { question: string; text: string; time: string }, now: Date = new Date()): string {
+  const header = `asis-66 · ${now.toLocaleString("es-AR")} · ${qa.time}`;
+  const sep = "=".repeat(60);
+  const q = qa.question.trim() || "(sin transcripción disponible)";
+  return [
+    header,
+    sep,
+    "",
+    "PREGUNTA:",
+    q,
+    "",
+    "RESPUESTA:",
+    qa.text.trim(),
+    "",
+    sep,
+    "",
+  ].join("\n");
+}
+
+/** Formato del .txt con toda la bitácora. */
+function formatSessionToTxt(items: HistoryItem[], now: Date = new Date()): string {
+  const sep = "=".repeat(60);
+  const header = `asis-66 · sesión del ${now.toLocaleString("es-AR")} · ${items.length} pregunta${items.length === 1 ? "" : "s"}`;
+  if (items.length === 0) {
+    return [header, sep, "", "(bitácora vacía)", "", sep, ""].join("\n");
+  }
+  // items[0] es el más reciente (porque el reducer prepende). Los mostramos
+  // en orden cronológico (más viejo → más nuevo) para que sea legible.
+  const ordered = [...items].reverse();
+  const blocks = ordered.map((it, i) => {
+    const q = it.question.trim() || "(sin transcripción disponible)";
+    return [
+      `[P${i + 1} · ${it.time}]`,
+      "",
+      "PREGUNTA:",
+      q,
+      "",
+      "RESPUESTA:",
+      it.text.trim(),
+      "",
+    ].join("\n");
+  });
+  return [header, sep, "", ...blocks, sep, ""].join("\n");
 }
 
 /** Elige la mejor voz en español disponible. */
@@ -210,7 +316,12 @@ export default function App() {
   const [keyInput, setKeyInput] = useState("");
   const [showKey, setShowKey] = useState(false);
   const [keySavedFlash, setKeySavedFlash] = useState(false);
-  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [history, setHistory] = useState<HistoryItem[]>(() => loadHistory());
+  /** Pregunta actual (transcrita por Gemini). Vacía si todavía no hay respuesta
+   *  o si el modelo no devolvió los marcadores. */
+  const [currentQuestion, setCurrentQuestion] = useState<string>("");
+  /** Flash que muestra "Guardado ✓" un instante después de bajar el .txt. */
+  const [savedFlash, setSavedFlash] = useState<boolean>(false);
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [inputDevices, setInputDevices] = useState<AudioDevice[]>([]);
   const [outputDevices, setOutputDevices] = useState<AudioDevice[]>([]);
@@ -341,6 +452,13 @@ export default function App() {
   useEffect(() => {
     setSfxMuted(muted);
   }, [muted]);
+
+  /* ----- Persistencia de la bitácora -----
+   * Cada vez que cambia `history`, lo guardamos en localStorage. El
+   * inicializador ya cargó lo que había al montar; acá solo sincronizamos. */
+  useEffect(() => {
+    saveHistory(history);
+  }, [history]);
 
   /* ----- Limpieza total al desmontar ----- */
   useEffect(() => {
@@ -632,6 +750,11 @@ export default function App() {
     elapsedRef.current = 0;
     setElapsed(0);
     setError("");
+    // Limpiamos la pregunta actual y la respuesta al comenzar una nueva
+    // grabación para que no se vea el contenido del turno anterior.
+    setCurrentQuestion("");
+    setResponse("");
+    setSavedFlash(false);
 
     goPhase("starting");
     setStatus("Solicitando micrófono…");
@@ -824,20 +947,28 @@ export default function App() {
       // prompt lo prohíbe pero el modelo a veces se "contagia" del audio
       // de entrada. La función sanitizeResponseText() los limpia como
       // red de seguridad antes de mostrar/leer el texto.
-      const text = sanitizeResponseText(rawText);
+      const cleaned = sanitizeResponseText(rawText);
+
+      // Separamos transcripción de la pregunta y respuesta académica.
+      // Si el modelo devolvió los marcadores, question viene con texto;
+      // si no, queda vacía y toda la respuesta se considera "answer".
+      const { question: transcribed, answer } = parseAnswer(cleaned);
+      const text = answer || cleaned; // fallback: si el parser no encontró nada usable
 
       responseRef.current = text;
       setResponse(text);
+      setCurrentQuestion(transcribed);
       setError("");
       setHistory((h) =>
         [
           {
             id: Date.now(),
             time: new Date().toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" }),
+            question: transcribed,
             text,
           },
           ...h,
-        ].slice(0, 8)
+        ].slice(0, HISTORY_MAX)
       );
 
       sfx.ready(); // beep alegre: respuesta lista
@@ -1000,11 +1131,39 @@ export default function App() {
       const clean = sanitizeResponseText(item.text);
       responseRef.current = clean;
       setResponse(clean);
+      setCurrentQuestion(item.question || "");
       sfx.ready();
       speak(clean);
     },
     [speak]
   );
+
+  /**
+   * Baja un .txt con la pregunta (transcripción) y la respuesta actuales.
+   * Flash "Guardado ✓" durante 1.8s para confirmar visualmente.
+   */
+  const onSaveCurrentAsTxt = useCallback(() => {
+    if (!response) return;
+    const qa = {
+      question: currentQuestion,
+      text: response,
+      time: new Date().toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" }),
+    };
+    downloadTxt(`asis66-${timestampForFilename()}.txt`, formatQAToTxt(qa));
+    setSavedFlash(true);
+    sfx.ready();
+    setTimeout(() => setSavedFlash(false), 1800);
+  }, [response, currentQuestion]);
+
+  /**
+   * Baja un .txt con toda la bitácora de la sesión. Si está vacía, igual
+   * genera un archivo con el placeholder "(bitácora vacía)" — útil como
+   * "recuerdo de qué estudiaste hoy" aunque no haya Q&A guardados.
+   */
+  const onExportSessionAsTxt = useCallback(() => {
+    downloadTxt(`asis66-sesion-${timestampForFilename()}.txt`, formatSessionToTxt(history));
+    sfx.ready();
+  }, [history]);
 
   /* ----- Derivados para la UI ----- */
   const effectiveKey = (savedKey || GEMINI_API_KEY).trim();
@@ -1160,7 +1319,36 @@ export default function App() {
                 </p>
               </div>
             ) : response ? (
-              <p className="answer-in whitespace-pre-wrap text-[15px] leading-relaxed text-[#f5b8d6]">{response}</p>
+              <>
+                {/* Pregunta transcrita (si Gemini devolvió los marcadores) */}
+                {currentQuestion && (
+                  <div className="answer-in mb-4 rounded-lg border border-[#5a1a48] bg-[#421a36] px-3.5 py-2.5">
+                    <p className="mb-1 font-mono-gem text-[10px] uppercase tracking-widest text-[#c47aae]">
+                      Tu pregunta (transcripción)
+                    </p>
+                    <p className="whitespace-pre-wrap text-sm italic leading-relaxed text-[#f5b8d6]/90">
+                      “{currentQuestion}”
+                    </p>
+                  </div>
+                )}
+                <p className="answer-in whitespace-pre-wrap text-[15px] leading-relaxed text-[#f5b8d6]">{response}</p>
+                {/* Botón para bajar el Q&A actual como .txt */}
+                <div className="answer-in mt-3 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={onSaveCurrentAsTxt}
+                    className="ctrl-btn flex items-center gap-1.5 rounded-md border border-[#5a1a48] bg-[#421a36] px-2.5 py-1.5 font-mono-gem text-[10px] uppercase tracking-widest text-[#e063b8] hover:border-[#e063b8]/50 hover:text-[#f278c4]"
+                    title="Bajar pregunta + respuesta como archivo .txt"
+                  >
+                    Guardar como .txt
+                  </button>
+                  {savedFlash && (
+                    <span className="font-mono-gem text-[10px] uppercase tracking-widest text-[#b89476]">
+                      Guardado ✓
+                    </span>
+                  )}
+                </div>
+              </>
             ) : (
               <div className="py-6 text-center">
                 <p className="mx-auto max-w-md text-sm leading-relaxed text-[#c47aae]">
@@ -1177,18 +1365,29 @@ export default function App() {
         <div className="flex min-w-0 flex-col gap-4">
           {/* Bitácora de sesión */}
           <section className="rounded-xl border border-[#5a1a48] bg-[#2a0d28] p-4 sm:p-5">
-            <div className="mb-3 flex items-center justify-between">
+            <div className="mb-3 flex items-center justify-between gap-2">
               <h2 className="flex items-center gap-2 font-display text-xs font-semibold uppercase tracking-[0.2em] text-[#c47aae]">
                 <HistoryIcon size={15} /> Bitácora
               </h2>
               {history.length > 0 && (
-                <button
-                  type="button"
-                  onClick={() => setHistory([])}
-                  className="ctrl-btn flex items-center gap-1.5 rounded-md border border-[#5a1a48] px-2 py-1 font-mono-gem text-[10px] uppercase tracking-widest text-[#c47aae] hover:border-[#f278c4]/50 hover:text-[#f278c4]"
-                >
-                  <TrashIcon size={12} /> Limpiar
-                </button>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={onExportSessionAsTxt}
+                    className="ctrl-btn flex items-center gap-1.5 rounded-md border border-[#5a1a48] px-2 py-1 font-mono-gem text-[10px] uppercase tracking-widest text-[#e063b8] hover:border-[#e063b8]/50 hover:text-[#f278c4]"
+                    title="Bajar toda la bitácora como .txt"
+                  >
+                    Exportar .txt
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setHistory([])}
+                    className="ctrl-btn flex items-center gap-1.5 rounded-md border border-[#5a1a48] px-2 py-1 font-mono-gem text-[10px] uppercase tracking-widest text-[#c47aae] hover:border-[#f278c4]/50 hover:text-[#f278c4]"
+                    title="Borrar la bitácora de este navegador"
+                  >
+                    <TrashIcon size={12} /> Limpiar
+                  </button>
+                </div>
               )}
             </div>
             {history.length === 0 ? (
@@ -1209,6 +1408,11 @@ export default function App() {
                         <span>R{history.length - i} · {item.time}</span>
                         <PlayIcon size={11} className="text-[#c47aae]" />
                       </span>
+                      {item.question && (
+                        <span className="mt-1 line-clamp-1 block text-[11px] italic text-[#c47aae]">
+                          {item.question}
+                        </span>
+                      )}
                       <span className="mt-1 line-clamp-2 block text-xs leading-relaxed text-[#f5b8d6]">
                         {item.text}
                       </span>
