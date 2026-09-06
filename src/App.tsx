@@ -100,6 +100,7 @@ const store = {
 /** Claves de localStorage que usa la app. Centralizadas para no typo'pearlas. */
 const LS_KEYS = {
   history: "gem-history",
+  autoSave: "gem-auto-save",
 } as const;
 
 /** Máximo de Q&A que se guardan en la bitácora persistente. */
@@ -147,10 +148,12 @@ function formatBytes(n: number): string {
   return `${(n / 1024).toFixed(1)} KB`;
 }
 
-/** Devuelve un timestamp tipo "2026-09-06-18-10" para nombres de archivo. */
+/** Devuelve un timestamp tipo "2026-09-06-18-10-45" para nombres de archivo.
+ *  Incluimos segundos para evitar colisiones cuando se guardan varios Q&A
+ *  en el mismo minuto (modo auto-save). */
 function timestampForFilename(d: Date = new Date()): string {
   const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}-${pad(d.getMinutes())}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
 }
 
 /** Dispara la descarga de un .txt con el nombre y contenido dados. */
@@ -322,6 +325,12 @@ export default function App() {
   const [currentQuestion, setCurrentQuestion] = useState<string>("");
   /** Flash que muestra "Guardado ✓" un instante después de bajar el .txt. */
   const [savedFlash, setSavedFlash] = useState<boolean>(false);
+  /** Si está activo, cada Q&A baja un .txt automáticamente sin pedir nada. */
+  const [autoSaveTxt, setAutoSaveTxt] = useState<boolean>(() => {
+    const v = store.get(LS_KEYS.autoSave);
+    // Por defecto ON: el usuario lo pidió así. Solo OFF si explícitamente lo guardó.
+    return v === null ? true : v === "1";
+  });
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [inputDevices, setInputDevices] = useState<AudioDevice[]>([]);
   const [outputDevices, setOutputDevices] = useState<AudioDevice[]>([]);
@@ -354,9 +363,13 @@ export default function App() {
   const utterRef = useRef<SpeechSynthesisUtterance | null>(null);
   const keyRef = useRef(savedKey);
   const voicesRef = useRef<SpeechSynthesisVoice[]>([]);
+  /** Mirror del flag de auto-save para que el callback del handler de
+   *  respuesta siempre vea el valor actual sin re-crearse. */
+  const autoSaveTxtRef = useRef(autoSaveTxt);
 
   keyRef.current = savedKey;
   voicesRef.current = voices;
+  autoSaveTxtRef.current = autoSaveTxt;
 
   /** Cambia la fase en el ref y en el estado a la vez. */
   const goPhase = useCallback((p: Phase) => {
@@ -459,6 +472,11 @@ export default function App() {
   useEffect(() => {
     saveHistory(history);
   }, [history]);
+
+  /* ----- Persistencia del flag de auto-save ----- */
+  useEffect(() => {
+    store.set(LS_KEYS.autoSave, autoSaveTxt ? "1" : "0");
+  }, [autoSaveTxt]);
 
   /* ----- Limpieza total al desmontar ----- */
   useEffect(() => {
@@ -970,6 +988,18 @@ export default function App() {
           ...h,
         ].slice(0, HISTORY_MAX)
       );
+
+      // Auto-save silencioso: si el flag está activo, bajamos un .txt
+      // sin preguntar nada. El navegador lo guarda en su carpeta de
+      // descargas por defecto (el usuario puede moverlo después).
+      if (autoSaveTxtRef.current) {
+        const qa = {
+          question: transcribed,
+          text,
+          time: new Date().toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" }),
+        };
+        downloadTxt(`asis66-${timestampForFilename()}.txt`, formatQAToTxt(qa));
+      }
 
       sfx.ready(); // beep alegre: respuesta lista
       speak(text); // lectura automática en voz alta
@@ -1561,6 +1591,38 @@ export default function App() {
                   ? "Usando la llave guardada en este navegador. También puedes fijarla en la constante GEMINI_API_KEY."
                   : "Sin llave aún: pégala arriba o edita la constante GEMINI_API_KEY en src/lib/gemini.ts."}
             </p>
+
+            <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-[#5a1a48] bg-[#421a36] px-3 py-2.5">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={autoSaveTxt}
+                onClick={() => setAutoSaveTxt((s) => !s)}
+                className={`ctrl-btn relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
+                  autoSaveTxt
+                    ? "border-[#e063b8]/70 bg-[#e063b8]/30"
+                    : "border-[#5a1a48] bg-[#2a0d28]"
+                }`}
+                title={autoSaveTxt ? "Desactivar auto-guardado" : "Activar auto-guardado"}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 rounded-full transition-transform ${
+                    autoSaveTxt ? "translate-x-4 bg-[#f278c4]" : "translate-x-0.5 bg-[#c47aae]"
+                  }`}
+                />
+              </button>
+              <div className="min-w-0 flex-1">
+                <p className="font-mono-gem text-[10px] uppercase tracking-widest text-[#c47aae]">
+                  Auto-guardar .txt
+                </p>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-[#c47aae]">
+                  Cada Q&amp;A baja un archivo{" "}
+                  <code className="font-mono-gem text-[10px] text-[#f5b8d6]">asis66-YYYY-MM-DD-HH-MM-SS.txt</code> a la
+                  carpeta de descargas. Sin clicks ni avisos. La carpeta destino
+                  se configura en el navegador.
+                </p>
+              </div>
+            </div>
 
             <div className="mt-4 grid grid-cols-2 gap-2">
               <div className="rounded-lg border border-[#5a1a48] bg-[#421a36] px-3 py-2.5">
