@@ -102,7 +102,6 @@ const store = {
 /** Claves de localStorage que usa la app. Centralizadas para no typo'pearlas. */
 const LS_KEYS = {
   history: "gem-history",
-  autoSave: "gem-auto-save",
   ghToken: "gem-gh-token",
 } as const;
 
@@ -328,14 +327,6 @@ export default function App() {
   const [currentQuestion, setCurrentQuestion] = useState<string>("");
   /** Flash que muestra "Guardado ✓" un instante después de bajar el .txt. */
   const [savedFlash, setSavedFlash] = useState<boolean>(false);
-  /** Si está activo, cada Q&A baja un .txt automáticamente sin pedir nada.
-   *  NOTA: en mobile (Chrome Android, etc.) el browser muestra un diálogo
-   *  "Elegí dónde descargarlo" en cada descarga, así que el auto-save local
-   *  está DESACTIVADO por default — el auto-commit a GitHub es la vía
-   *  silenciosa de persistencia. El usuario puede activarlo desde la UI. */
-  const [autoSaveTxt, setAutoSaveTxt] = useState<boolean>(() => {
-    return store.get(LS_KEYS.autoSave) === "1";
-  });
   /* -------- GitHub auto-commit (SIEMPRE activo) -------- */
   /** PAT del usuario para Contents API. Único dato configurable — se pide una
    *  sola vez en un banner mínimo, después queda persistido en localStorage.
@@ -381,12 +372,11 @@ export default function App() {
   /** Mirror del flag de auto-save para que el callback del handler de
    *  respuesta siempre vea el valor actual sin re-crearse. */
   const autoSaveTxtRef = useRef(autoSaveTxt);
-  /** Mirror del PAT de GitHub para el mismo motivo. */
+  /** Mirror del PAT de GitHub para el callback del handler de respuesta. */
   const ghTokenRef = useRef(ghToken);
 
   keyRef.current = savedKey;
   voicesRef.current = voices;
-  autoSaveTxtRef.current = autoSaveTxt;
   ghTokenRef.current = ghToken;
 
   /** Cambia la fase en el ref y en el estado a la vez. */
@@ -490,11 +480,6 @@ export default function App() {
   useEffect(() => {
     saveHistory(history);
   }, [history]);
-
-  /* ----- Persistencia del flag de auto-save ----- */
-  useEffect(() => {
-    store.set(LS_KEYS.autoSave, autoSaveTxt ? "1" : "0");
-  }, [autoSaveTxt]);
 
   /* ----- Persistencia del PAT de GitHub -----
    * El PAT se persiste tal cual: el usuario es el único dueño de su
@@ -1016,13 +1001,18 @@ export default function App() {
       // prompt lo prohíbe pero el modelo a veces se "contagia" del audio
       // de entrada. La función sanitizeResponseText() los limpia como
       // red de seguridad antes de mostrar/leer el texto.
-      const cleaned = sanitizeResponseText(rawText);
-
-      // Separamos transcripción de la pregunta y respuesta académica.
-      // Si el modelo devolvió los marcadores, question viene con texto;
-      // si no, queda vacía y toda la respuesta se considera "answer".
-      const { question: transcribed, answer } = parseAnswer(cleaned);
-      const text = answer || cleaned; // fallback: si el parser no encontró nada usable
+      //
+      // IMPORTANTE: parseamos ANTES de sanitizar. Si sanitizamos primero,
+      // los marcadores <PREGUNTA>/<RESPUESTA> desaparecen y el parser
+      // no puede extraer la transcripción. Después de parsear, sanitizamos
+      // pregunta y respuesta por separado para que el usuario NUNCA vea
+      // los marcadores literales.
+      const parsed = parseAnswer(rawText);
+      const transcribed = sanitizeResponseText(parsed.question);
+      const answer = sanitizeResponseText(parsed.answer);
+      // Fallback: si el parser no encontró nada usable (modelo no usó
+      // marcadores), sanitizamos el texto completo y lo usamos como answer.
+      const text = answer || sanitizeResponseText(rawText);
 
       responseRef.current = text;
       setResponse(text);
@@ -1039,18 +1029,6 @@ export default function App() {
           ...h,
         ].slice(0, HISTORY_MAX)
       );
-
-      // Auto-save silencioso: si el flag está activo, bajamos un .txt
-      // sin preguntar nada. El navegador lo guarda en su carpeta de
-      // descargas por defecto (el usuario puede moverlo después).
-      if (autoSaveTxtRef.current) {
-        const qa = {
-          question: transcribed,
-          text,
-          time: new Date().toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" }),
-        };
-        downloadTxt(`asis66-${timestampForFilename()}.txt`, formatQAToTxt(qa));
-      }
 
       // Auto-commit a GitHub: SIEMPRE activo, no hay toggle. Si hay PAT
       // en localStorage, sube el .txt al repo (GH_CONFIG) sin preguntar.
@@ -1680,40 +1658,12 @@ export default function App() {
                   : "Sin llave aún: pégala arriba o edita la constante GEMINI_API_KEY en src/lib/gemini.ts."}
             </p>
 
-            <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-[#5a1a48] bg-[#421a36] px-3 py-2.5">
-              <button
-                type="button"
-                role="switch"
-                aria-checked={autoSaveTxt}
-                onClick={() => setAutoSaveTxt((s) => !s)}
-                className={`ctrl-btn relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
-                  autoSaveTxt
-                    ? "border-[#e063b8]/70 bg-[#e063b8]/30"
-                    : "border-[#5a1a48] bg-[#2a0d28]"
-                }`}
-                title={autoSaveTxt ? "Desactivar auto-guardado local" : "Activar auto-guardado local"}
-              >
-                <span
-                  className={`inline-block h-3.5 w-3.5 rounded-full transition-transform ${
-                    autoSaveTxt ? "translate-x-4 bg-[#f278c4]" : "translate-x-0.5 bg-[#c47aae]"
-                  }`}
-                />
-              </button>
-              <div className="min-w-0 flex-1">
-                <p className="font-mono-gem text-[10px] uppercase tracking-widest text-[#c47aae]">
-                  Auto-guardar .txt (local, OFF por default)
-                </p>
-                <p className="mt-0.5 text-[11px] leading-relaxed text-[#c47aae]">
-                  Si lo activás, cada Q&amp;A baja un archivo{" "}
-                  <code className="font-mono-gem text-[10px] text-[#f5b8d6]">asis66-YYYY-MM-DD-HH-MM-SS.txt</code>{" "}
-                  a la carpeta de descargas. <b className="text-[#e063b8]">En mobile (Chrome Android,
-                  Samsung Internet, etc.) el browser muestra un diálogo
-                  "Elegí dónde descargarlo" en cada Q&amp;A</b> — por eso está
-                  OFF por default. La persistencia silenciosa la hace el
-                  auto-commit a GitHub (que está siempre activo).
-                </p>
-              </div>
-            </div>
+            {/* Auto-save local eliminado: en mobile (Chrome Android, Samsung
+                Internet, etc.) el browser muestra un diálogo "Elegí dónde
+                descargarlo" en cada Q&A. La persistencia silenciosa se hace
+                vía auto-commit a GitHub. Los botones manuales (Guardar como
+                .txt debajo de la respuesta, Exportar .txt en la bitácora)
+                siguen disponibles para bajadas puntuales. */}
 
             {/* Link al repo + estado del último commit (NO es un panel: solo info.
                 No hay toggles, no hay inputs. El auto-commit a GitHub está

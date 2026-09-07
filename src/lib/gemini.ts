@@ -213,6 +213,11 @@ export function blobToBase64(blob: Blob): Promise<string> {
 export function sanitizeResponseText(text: string): string {
   if (!text) return text;
   let t = text;
+  // 0) Marcadores <PREGUNTA>/<RESPUESTA>: el modelo a veces los emite
+  //    literales aunque los haya puesto como delimitadores. Los sacamos
+  //    antes que nada para que nunca lleguen al usuario ni al TTS.
+  //    Case-insensitive y tolerante a espacios.
+  t = t.replace(/<\s*\/?\s*(?:PREGUNTA|RESPUESTA|P)\s*>/gi, "");
   // 1) Índices de bloque SRT: una línea entera que es solo 1-4 dígitos
   t = t.replace(/^\s*\d{1,4}\s*$/gm, "");
   // 2) Rangos SRT/VTT: "00:05 --> 00:08" / "00:05,000 --> 00:08,000"
@@ -264,23 +269,72 @@ export interface ParsedAnswer {
  * devolvió (fallback), trata todo el texto como respuesta y deja `question`
  * vacío. La regex es case-insensitive y tolerante a saltos de línea.
  */
+// Regex única, simple, sin backtracking exponencial.
+// Matchea: <PREGUNTA ...> contenido </PREGUNTA ...> ... <RESPUESTA ...> contenido </RESPUESTA ...>
+// Acepta: <pregunta>, <PREGUNTA>, < pregunta >, con attrs tipo lang="es", cierre con o sin espacios.
+const MARKER_RE = /<\s*\/?\s*(PREGUNTA|RESPUESTA)(?:\s[^>]*)?>/gi;
+
+/** Saca cualquier tag de marker del texto (defensa en profundidad). */
+function stripMarkers(text: string): string {
+  return text.replace(MARKER_RE, "");
+}
+
 export function parseAnswer(text: string): ParsedAnswer {
   if (!text) return { question: "", answer: "" };
-  const m = text.match(
-    /<PREGUNTA>([\s\S]*?)<\/PREGUNTA>\s*<RESPUESTA>([\s\S]*?)<\/RESPUESTA>/i
-  );
-  if (m) {
+
+  // Regex simple y case-insensitive para los pares de markers.
+  // Usamos un patrón sin cuantificadores ambiguos para evitar backtracking.
+  const Q_OPEN = /<\s*PREGUNTA(?:\s[^>]*)?\s*>/i;
+  const Q_CLOSE = /<\s*\/\s*PREGUNTA\s*>/i;
+  const R_OPEN = /<\s*RESPUESTA(?:\s[^>]*)?\s*>/i;
+  const R_CLOSE = /<\s*\/\s*RESPUESTA\s*>/i;
+
+  // Caso 1: ambos pares presentes. Tomamos el contenido entre ellos.
+  if (Q_OPEN.test(text) && Q_CLOSE.test(text) && R_OPEN.test(text) && R_CLOSE.test(text)) {
+    const qStart = text.search(Q_OPEN) + text.match(Q_OPEN)![0].length;
+    const qEnd = text.search(Q_CLOSE);
+    const rStart = text.search(R_OPEN) + text.match(R_OPEN)![0].length;
+    const rEnd = text.search(R_CLOSE);
+    if (qEnd > qStart && rEnd > rStart) {
+      return {
+        question: text.slice(qStart, qEnd).trim(),
+        answer: text.slice(rStart, rEnd).trim(),
+      };
+    }
+  }
+
+  // Caso 2: solo <RESPUESTA>...</RESPUESTA> presente. Lo previo es la pregunta.
+  if (R_OPEN.test(text) && R_CLOSE.test(text)) {
+    const rStart = text.search(R_OPEN) + text.match(R_OPEN)![0].length;
+    const rEnd = text.search(R_CLOSE);
+    const before = text.slice(0, text.search(R_OPEN));
     return {
-      question: m[1].trim(),
-      answer: m[2].trim(),
+      question: stripMarkers(before).trim(),
+      answer: text.slice(rStart, rEnd).trim(),
     };
   }
-  // Fallback: puede que el modelo haya escrito solo "Pregunta: ... Respuesta: ..."
-  // en prosa. Hacemos un split defensivo por la palabra "Respuesta:" si aparece.
+
+  // Caso 3: solo <PREGUNTA>...</PREGUNTA> presente. Lo posterior es la respuesta.
+  if (Q_OPEN.test(text) && Q_CLOSE.test(text)) {
+    const qStart = text.search(Q_OPEN) + text.match(Q_OPEN)![0].length;
+    const qEnd = text.search(Q_CLOSE);
+    const after = text.slice(qEnd + text.match(Q_CLOSE)![0].length);
+    return {
+      question: text.slice(qStart, qEnd).trim(),
+      answer: stripMarkers(after).trim(),
+    };
+  }
+
+  // Caso 4: prosa tipo "Pregunta: ... Respuesta: ..." (sin markers).
   const loose = text.split(/^(?:\s*)?(?:Respuesta|R)\s*:\s*/im);
   if (loose.length >= 2) {
-    return { question: loose[0].trim(), answer: loose.slice(1).join("\n").trim() };
+    return {
+      question: loose[0].replace(/^(?:\s*)?(?:Pregunta|P|Q)\s*:\s*/i, "").trim(),
+      answer: loose.slice(1).join("\n").trim(),
+    };
   }
+
+  // Sin estructura reconocible: todo es respuesta, pregunta vacía.
   return { question: "", answer: text.trim() };
 }
 
