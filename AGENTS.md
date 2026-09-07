@@ -307,7 +307,7 @@ Después de eso: cero clicks. Cada Q&A se commitea solo.
 | **Historial de git** | Un commit por Q&A. Si te molesta, ignorar la carpeta en `git log` o configurar squash. |
 | **Concurrencia** | Si dos tabs hacen PUT al mismo path en el mismo segundo, el segundo falla con 422. La UI debe mostrar el error y seguir. |
 | **Offline** | Si no hay red, el commit falla silenciosamente. La app sigue funcionando, el Q&A queda solo en local. |
-| **⚠ Descarga local en mobile** | El patrón de auto-descarga (`<a download>`) en Chrome Android / Samsung Internet muestra un diálogo "Elegí dónde descargarlo" en CADA Q&A. Es invasivo y rompe la experiencia "fire-and-forget". Por eso el auto-commit a GitHub es la vía recomendada: silenciosa, sin diálogos, sin importar el dispositivo. Si tu caso de uso es mobile, NO actives auto-descarga local — usá solo el commit a GitHub. |
+| **⚠ Descarga local en mobile** | El patrón de auto-descarga (`<a download>`) en Chrome Android / Samsung Internet / Brave muestra un diálogo "Elegí dónde descargarlo" en CADA Q&A. Es invasivo y rompe la experiencia "fire-and-forget". **Por eso la auto-descarga local NO se incluye en la receta recomendada** — usá solo el auto-commit a GitHub (silencioso en cualquier dispositivo). Los botones manuales (Guardar / Exportar sesión) siguen disponibles para bajadas puntuales donde el diálogo se espera. |
 
 ---
 
